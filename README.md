@@ -14,7 +14,7 @@ Additionally, adaptive trust regions are dynamically formed to expedite the conv
 points.
 
 <p align="center">
-    <img src="images/cobbo.png" alt="cobbo" width="70%">
+    <img src="images/cobbo.png" alt="cobbo" width="85%">
 </p>
 
 ### Requirements
