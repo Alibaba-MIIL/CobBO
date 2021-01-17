@@ -59,7 +59,7 @@ class CobBO(AbstractOptimizer):
 
         self.pbounds = pbounds
         self.api = api_config is not None
-        if self.pbounds is None:
+        if self.api:
             param_type_dict_name_range, self.round_to_values, self.equiv_point_neighbor, \
             self.logs_params, self.logits_params, self.cats_params, self.ints_params, self.cardinality = \
                 CobBO._api_config_to_pbounds_and_rounding(api_config)
@@ -202,7 +202,7 @@ class CobBO(AbstractOptimizer):
         X = self.space.impl_suggest_kernel(n_suggestions)
         X = [dict(zip(self.space.keys, x)) for x in X]
         if not self.api:
-            return X[0]
+            return X
 
         # Convert log to linear
         for x in X:
@@ -230,7 +230,7 @@ class CobBO(AbstractOptimizer):
             Corresponding values where objective has been evaluated
         """
         if self.api:
-            if -np.Inf in y or np.Inf in y:
+            if np.isinf(y).any():
                 print("y contains -inf: y=", y)
             # Convert linear to log
             for x in X:

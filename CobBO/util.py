@@ -123,7 +123,6 @@ def normalize_probability(probability):
     probability[-1] = 1.0 - sum(probability[0:len(probability) - 1])
     return probability
 
-
 def assign_probability(dim):
     probability = np.ones(dim) / float(dim)
     return normalize_probability(probability)

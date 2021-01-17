@@ -388,7 +388,7 @@ class KernelSpace(object):
         return min(self.rr_set[self.rr_idx], self.dim//2)
 
     def progress(self):
-        return (self.iteration-self.restart_at_iteration)/(self._n_iter-self.restart_at_iteration)
+        return self.iteration/self._n_iter
 
     def impl_suggest_kernel(self, n_suggestions=1):
         while len(self.queue_new_X) < n_suggestions and self.has_unused_trial_budget():
@@ -562,8 +562,6 @@ class KernelSpace(object):
         ratio = ratio_set[index]
 
         return ratio * factor
-
-
 
     def half_rr_ratio(self):
         self.rr_ratio /= 2.0
@@ -892,7 +890,7 @@ class KernelSpace(object):
     def observe(self, X, y, is_rd_sample, k_indexes, util_id):
         X = self._as_array(X)
 
-        if np.isinf(X).any() or np.isnan(X).any():
+        if np.isinf(X).any() or np.isnan(X).any() or np.isinf(y).any() or np.isnan(y).any():
             return
 
         self.has_improve = False
@@ -1974,7 +1972,7 @@ class KernelSpace(object):
 
             self.stay += 1
 
-        if params is None or len(params) <= 1:
+        if params is None or len(params) <= 1 or np.isnan(params).any() or np.isinf(params).any():
             if self._anchor is not None and len(self._anchor) > 0:
                 self.add_random_points(add_num=3, option=1)
             else:
@@ -1991,7 +1989,11 @@ class KernelSpace(object):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             self._gp_before_fit(k_indexes)
-            self._gp.fit(params, targets)
+            try:
+                self._gp.fit(params, targets)
+            except ValueError:
+                self.add_random_points(add_num=1, option=0)
+                return None, None
             self._gp_after_fit(k_indexes)
 
         if self.debug:
@@ -2081,7 +2083,7 @@ class KernelSpace(object):
         return self.suggest_by_cob(utility_function)
 
     def too_many_consecutive_fails_condition(self):
-        if self.progress() > 0.7:
+        if self.progress() > 0.75:
             if self.data_cluster_array is None or \
                     self.data_cluster_array is not None and self.index_partition == 0:
                 return False
@@ -2093,7 +2095,7 @@ class KernelSpace(object):
         if self.dim <= 20:
             cap = int(1.9*cap)
 
-        return self.progress() < 0.75 and self._slowness >= min(0.1*self._n_iter, cap)
+        return self._slowness >= min(0.1*self._n_iter, cap)
 
     def enough_trials_for_one_partition(self):
         if self.data_cluster_array is None \
@@ -2126,10 +2128,10 @@ class KernelSpace(object):
 
         # Shrink the original_bounds at the last stage of trials
         progress = self.progress()
-        if progress > 0.7 and self.iteration >= self.iter_can_shrink_space:
-            ratio = 0.7-(progress-0.7)*1.5
+        if progress > 0.75 and self.iteration >= self.iter_can_shrink_space:
+            ratio = 0.8-(progress-0.75)*1.5
             self.shrink_total_space(ratio=ratio)
-            self.iter_can_shrink_space = self.iteration + max(int(0.1 * self._n_iter), 50)
+            self.iter_can_shrink_space = self.iteration + max(int(0.1 * self._n_iter), 25)
 
         # Filter out data points if too many are in the current space
         if (len(self) > self.data_num_cap or len(self._full_targets) > 2.0*self.data_num_cap)\

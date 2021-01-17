@@ -14,24 +14,20 @@ def maximize(obj_func, optimizer):
 
     Parameters
     ----------
-    optimizer : The CobBO optimizer object
     obj_func : method
         The objective function to be optimized
-    verbose : bool
-        Print the optimization progress details and total runtime
+    optimizer : The CobBO optimizer object
 
     Returns
     -------
-    best_solution : list array-like
-        List of `n_suggestions` suggestions to evaluate the objective
-        function. Each suggestion is a dictionary where each key
-        corresponds to a parameter being optimized.
+    best_point : A dictionary
+        The point with the best objective value obsereved. Each key corresponds to a parameter being optimized.
     """
     assert isinstance(optimizer, CobBO), ' A CobBO optimizer is expected'
 
     while optimizer.has_budget:
         x_probe_list = optimizer.suggest(n_suggestions=optimizer.batch)
-        target_list = obj_func(**x_probe_list)
+        target_list = [obj_func(**x) for x in x_probe_list]
         optimizer.observe(x_probe_list, target_list)
 
     return optimizer.best_point
