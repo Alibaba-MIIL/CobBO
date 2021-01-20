@@ -8,31 +8,6 @@ def black_box_function(**kvargs):
     x = np.array([item[1] for item in sorted(kvargs.items(), key=lambda z: z[0])])
     return Rastrigin(x)
 
-
-def maximize(obj_func, optimizer):
-    """Maximize a given objective function
-
-    Parameters
-    ----------
-    obj_func : method
-        The objective function to be optimized
-    optimizer : The CobBO optimizer object
-
-    Returns
-    -------
-    best_point : A dictionary
-        The point with the best objective value obsereved. Each key corresponds to a parameter being optimized.
-    """
-    assert isinstance(optimizer, CobBO), ' A CobBO optimizer is expected'
-
-    while optimizer.has_budget:
-        x_probe_list = optimizer.suggest(n_suggestions=optimizer.batch)
-        target_list = [obj_func(**x) for x in x_probe_list]
-        optimizer.observe(x_probe_list, target_list)
-
-    return optimizer.best_point
-
-
 def test(black_box_func, pbounds, num_iter, init_points=0):
     optimizer = CobBO(
         api_config=None,
@@ -44,7 +19,7 @@ def test(black_box_func, pbounds, num_iter, init_points=0):
 
     # The optimizer maximizes the function f
     begin_time = datetime.now()
-    solution = maximize(black_box_func, optimizer)
+    optimizer.maximize(black_box_func, optimizer, use_real_space=True)
     print('Total Runtime [seconds]:', (datetime.now() - begin_time).total_seconds())
 
 

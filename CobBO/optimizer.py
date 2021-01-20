@@ -182,7 +182,6 @@ class CobBO(AbstractOptimizer):
 
         return param_type_dict_name_range, round_to_values, equiv_point_neighbor, logs, logits, cats, ints, cardinality
 
-
     def suggest(self, n_suggestions=1):
         """Get suggestions from the optimizer.
 
@@ -199,23 +198,57 @@ class CobBO(AbstractOptimizer):
             function. Each suggestion is a dictionary where each key
             corresponds to a parameter being optimized.
         """
-        X = self.space.impl_suggest_kernel(n_suggestions)
-        X = [dict(zip(self.space.keys, x)) for x in X]
-        if not self.api:
-            return X
-
-        # Convert log to linear
-        for x in X:
-            for param_name in self.logits_params:
-                x[param_name] = ss.expit(x[param_name])
-            for param_name in self.logs_params:
-                x[param_name] = 10 ** x[param_name]
-            for param_name in self.cats_params:
-                x[param_name] = self.round_to_values[param_name](x[param_name])
-            for param_name in self.ints_params:
-                x[param_name] = int(x[param_name])
+        X = self.suggest_as_real_values(n_suggestions)
+        X = self.convert_real_to_target_type(X)
 
         return X
+
+    def suggest_as_real_values(self, n_suggestions=1):
+        X = self.space.impl_suggest_kernel(n_suggestions)
+        X = [dict(zip(self.space.keys, x)) for x in X]
+        return X
+
+    def convert_real_to_target_type(self, X):
+        if self.api:
+            for x in X:
+                for param_name in self.logits_params:
+                    x[param_name] = ss.expit(x[param_name])
+                for param_name in self.logs_params:
+                    x[param_name] = 10 ** x[param_name]
+                for param_name in self.cats_params:
+                    x[param_name] = self.round_to_values[param_name](x[param_name])
+                for param_name in self.ints_params:
+                    x[param_name] = int(x[param_name])
+        return X
+
+    def maximize(self, obj_func, optimizer, use_real_space=False):
+        """Maximize a given objective function
+
+        Parameters
+        ----------
+        obj_func : method
+            The objective function to be optimized
+        optimizer : The CobBO optimizer object
+
+        Returns
+        -------
+        best_point : A dictionary
+            The point with the best objective value obsereved. Each key corresponds to a parameter being optimized.
+        """
+        assert isinstance(optimizer, CobBO), ' A CobBO optimizer is expected'
+
+        while optimizer.has_budget:
+            if not use_real_space:
+                x_probe_list = self.suggest(n_suggestions=self.batch)
+                target_list = [obj_func(**x) for x in x_probe_list]
+                self.observe(x_probe_list, target_list)
+            else:
+                x_probe_real_list = self.suggest_as_real_values(n_suggestions=self.batch)
+                x_probe_list = self.convert_real_to_target_type(np.copy(x_probe_real_list))
+                target_list = [obj_func(**x) for x in x_probe_list]
+                self.observe(x_probe_real_list, target_list)
+
+        return self.best_point
 
     def observe(self, X, y, verbose=False):
         """Feed an observation back.
