@@ -53,7 +53,7 @@ class KernelSpace(object):
         self.consistent_query = consistent_query
         self.restart = restart
         self.restart_at_iteration = 0
-        self.can_sample = True if self.dim >= 2 else False
+        self.can_sample = True if self.dim >= 5 else False
         self.allow_partition = allow_partition
 
         self.multisample = 1
@@ -272,7 +272,6 @@ class KernelSpace(object):
         self.restart_num = 0
         self.restart_threshold = 1 if self._n_iter < 10000 else 3
 
-
         # For modification by median number
         self.modify_by_median_num = 0
         self.last_time_modify = 0
@@ -288,8 +287,8 @@ class KernelSpace(object):
         # For shrinking_ratio
         self.shrink_ratio_1, self.shrink_ratio_2, self.shrink_ratio_3 = 0.5, 0.6, 0.7
 
-        self.threshold_cap_base = 15
-        self.threshold_cap_start = 15
+        self.threshold_cap_base = 15 if not self.small_trial() else 10
+        self.threshold_cap_start = 15 if not self.small_trial() else 10
 
         self.can_do_rr = (self.dim >= 30) or (self.dim >= 20 and self._n_iter >= 1000)
 
@@ -420,7 +419,7 @@ class KernelSpace(object):
                 self.iteration += 1
 
         else:
-            if self._fails >= 10 and np.mod(self._fails, self.threshold_explore) == 0:
+            if self._fails >= 10 and np.mod(self._fails, self.threshold_explore) == 0 and not self.small_trial():
                 self.util_explore.kappa = self.get_kappa()
                 self.util_id = len(self.util_list)
                 x_probe_list, k_indexes = self.do_suggestion(self.util_explore)
@@ -437,7 +436,7 @@ class KernelSpace(object):
 
     def get_kappa(self):
         x = self._consecutive_fails/23
-        upper = 3.5 if self.large_trial() else 2.5
+        upper = 3.5 if self.large_trial() else 1.0 if self.small_trial() else 2.5
         ratio = x - np.floor(x/upper) * upper
         return self.kappa * (1.0 + ratio)
 
@@ -1084,7 +1083,7 @@ class KernelSpace(object):
         self._success_after_adj = 0.0
         self._adj_num -= 1
         self.has_reached_max_level = False
-        print("pop-- level=", self._adj_num)
+        print("pop--: level=", self._adj_num)
 
     def pop_halve_bounds(self):
         self._params = self._full_params
@@ -1118,7 +1117,9 @@ class KernelSpace(object):
                 weights[row] = max((right-left)/(up-low), 0.1)
             else:
                 weights[row] = 1.0
-        weights = weights / np.prod(np.power(weights, 1.0 / len(weights)))
+        weights_max = max(weights)
+        weights = np.clip(weights, 0.7*weights_max, None)
+        weights = weights / weights_max
         return weights
 
     def help_adjust_bounds(self):
@@ -1221,7 +1222,7 @@ class KernelSpace(object):
         self.filter_data_by_bounds()
         if self.adjust_success():
             self._success_after_adj = 0.0
-            print("push ++: level=", self._adj_num)
+            print("push++: level=", self._adj_num)
 
         else:
             self.deque_bounds()
@@ -1480,7 +1481,8 @@ class KernelSpace(object):
                 self.data_cluster_array[i] = data_clusters[_hashable(center_params[sorted_indexes[i]])]
 
     def set_random_anchor(self):
-        cycle = 5 * self.stay_max
+        multi = self.stay_max if not self.small_trial() else min(self.stay_max, 2)
+        cycle = 5 * multi
 
         if np.mod(self.iteration, cycle) < cycle-1 and self.with_random_anchor():
             return
@@ -2002,8 +2004,11 @@ class KernelSpace(object):
 
         self.top_sample = 1
         progress = self.progress()
-        if len(k_indexes) < 3:
-            self.multisample = 1
+        if len(k_indexes) < 5:
+            if np.mod(self._consecutive_fails, 20) < 10:
+                self.multisample = 1
+            else:
+                self.multisample = 2
         else:
             if self._consecutive_fails > 20:
                 if self.large_trial():
@@ -2030,10 +2035,6 @@ class KernelSpace(object):
         bounds = (self.bounds[k_indexes]-self._original_bounds[k_indexes, 0][:, None])\
                  /(self._original_bounds[k_indexes, 1][:, None] - self._original_bounds[k_indexes, 0][:, None])
 
-        if self._anchor is not None and len(self) > 900:
-            dec_ratio = np.clip(1.0 - 0.1 * (len(self) - 550) / 150, 0.8, 0.95)
-            bounds = self.do_shrink_bounds(ratio=dec_ratio, bounds=bounds, anchor_sub=self._anchor[k_indexes])
-
         suggestion_subindex_list = acq_max(
             ac=utility_function.utility,
             gp=self._gp,
@@ -2045,7 +2046,7 @@ class KernelSpace(object):
             top_sample=self.top_sample
         )
 
-        suggestion_subindex_list_copy = [self.out_unit_cube(x, k_indexes) for x in suggestion_subindex_list]
+        suggestion_subindex_list_copy = np.array([self.out_unit_cube(x, k_indexes) for x in suggestion_subindex_list])
 
         if self.debug:
             print("step 4: max acquisition, multisample=", self.multisample,\
@@ -2055,7 +2056,6 @@ class KernelSpace(object):
         if self.can_sample:
             suggestion_list = np.empty((len(suggestion_subindex_list_copy), self.dim))
             for i in range(len(suggestion_list)):
-                suggestion_list[i] = np.empty(self.dim)
                 suggestion_list[i][k_indexes] = suggestion_subindex_list_copy[i]
                 a = np.arange(self.dim)
                 mask = np.zeros(a.shape, dtype=bool)
@@ -2065,7 +2065,7 @@ class KernelSpace(object):
         else:
             suggestion_list = suggestion_subindex_list_copy
 
-        a = np.arange(suggestion_list.shape[0])
+        a = np.arange(len(suggestion_list))
         mask = np.zeros(a.shape, dtype=bool)
         for i in a:
             if suggestion_list[i] not in self:
@@ -2090,12 +2090,15 @@ class KernelSpace(object):
             else:
                 return True
 
-        cap = 150 if self.large_trial() else 70
-        cap = min(250, int((1.0 + 0.1 * self.num_restart_space) * cap))
-        if self.dim <= 20:
-            cap = int(1.9*cap)
+        if self.dim > 5:
+            cap = 150 if self.large_trial() else 70
+            cap = min(250, int((1.0 + 0.1 * self.num_restart_space) * cap))
+            if self.dim <= 20:
+                cap = int(1.9*cap)
+        else:
+            cap = 80 if self.large_trial() else 50 if not self.small_trial() else 25
 
-        return self._slowness >= min(0.1*self._n_iter, cap)
+        return self._slowness >= min(0.15*self._n_iter, cap)
 
     def enough_trials_for_one_partition(self):
         if self.data_cluster_array is None \
@@ -2113,7 +2116,7 @@ class KernelSpace(object):
     def do_suggestion(self, utility_function):
         """New points to evaluate"""
 
-        if len(self) == 0:
+        if len(self._full_params) == 0:
             self.need_init_sample_iteration = self.iteration
             self.queue_init_X(self.init_points)
             return None, None
@@ -2321,7 +2324,7 @@ class KernelSpace(object):
         return (data_points - lb) / (ub - lb)
 
     def out_unit_cube(self, data_points, k_indexes):
-        lb, ub = self.bounds[k_indexes, 0], self.bounds[k_indexes, 1]
+        lb, ub = self._original_bounds[k_indexes, 0], self._original_bounds[k_indexes, 1]
         return data_points * (ub - lb) + lb
 
     def __contains__(self, x):
@@ -2372,6 +2375,9 @@ class KernelSpace(object):
 
     def large_trial(self):
         return self._n_iter > 2000
+
+    def small_trial(self):
+        return self._n_iter <= 200
 
     def budget(self):
         return self._n_iter - self.iteration

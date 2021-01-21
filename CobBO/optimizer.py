@@ -10,6 +10,7 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = '4' # export VECLIB_MAXIMUM_THREADS=4
 os.environ["NUMEXPR_NUM_THREADS"] = '6' # export NUMEXPR_NUM_THREADS=6
 
 import numpy as np
+import copy
 import math
 
 import scipy.special as ss
@@ -218,37 +219,8 @@ class CobBO(AbstractOptimizer):
                 for param_name in self.cats_params:
                     x[param_name] = self.round_to_values[param_name](x[param_name])
                 for param_name in self.ints_params:
-                    x[param_name] = int(x[param_name])
+                    x[param_name] = int(math.floor(x[param_name]))
         return X
-
-    def maximize(self, obj_func, optimizer, use_real_space=False):
-        """Maximize a given objective function
-
-        Parameters
-        ----------
-        obj_func : method
-            The objective function to be optimized
-        optimizer : The CobBO optimizer object
-
-        Returns
-        -------
-        best_point : A dictionary
-            The point with the best objective value obsereved. Each key corresponds to a parameter being optimized.
-        """
-        assert isinstance(optimizer, CobBO), ' A CobBO optimizer is expected'
-
-        while optimizer.has_budget:
-            if not use_real_space:
-                x_probe_list = self.suggest(n_suggestions=self.batch)
-                target_list = [obj_func(**x) for x in x_probe_list]
-                self.observe(x_probe_list, target_list)
-            else:
-                x_probe_real_list = self.suggest_as_real_values(n_suggestions=self.batch)
-                x_probe_list = self.convert_real_to_target_type(np.copy(x_probe_real_list))
-                target_list = [obj_func(**x) for x in x_probe_list]
-                self.observe(x_probe_real_list, target_list)
-
-        return self.best_point
 
     def observe(self, X, y, verbose=False):
         """Feed an observation back.
@@ -293,6 +265,35 @@ class CobBO(AbstractOptimizer):
 
         if verbose:
             self.space.heart_beat_print(num=25)
+
+    def maximize(self, obj_func, optimizer, use_real_space=False):
+        """Maximize a given objective function
+
+        Parameters
+        ----------
+        obj_func : method
+            The objective function to be optimized
+        optimizer : The CobBO optimizer object
+
+        Returns
+        -------
+        best_point : A dictionary
+            The point with the best objective value obsereved. Each key corresponds to a parameter being optimized.
+        """
+        assert isinstance(optimizer, CobBO), ' A CobBO optimizer is expected'
+
+        while optimizer.has_budget:
+            if not use_real_space:
+                x_probe_list = self.suggest(n_suggestions=self.batch)
+                target_list = [obj_func(**x) for x in x_probe_list]
+                self.observe(x_probe_list, target_list)
+            else:
+                x_probe_real_list = self.suggest_as_real_values(n_suggestions=self.batch)
+                x_probe_list = self.convert_real_to_target_type(copy.deepcopy(x_probe_real_list))
+                target_list = [obj_func(**x) for x in x_probe_list]
+                self.observe(x_probe_real_list, target_list)
+
+        return self.best_point
 
     @property
     def has_budget(self):
