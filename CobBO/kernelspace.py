@@ -2034,13 +2034,14 @@ class KernelSpace(object):
 
         bounds = (self.bounds[k_indexes]-self._original_bounds[k_indexes, 0][:, None])\
                  /(self._original_bounds[k_indexes, 1][:, None] - self._original_bounds[k_indexes, 0][:, None])
+        anchor = self.in_unit_cube(self._anchor[k_indexes], k_indexes)
 
         suggestion_subindex_list = acq_max(
             ac=utility_function.utility,
             gp=self._gp,
             multisample=self.multisample,
             y_max=self._max_target,
-            x_max=self._anchor[k_indexes],
+            x_max=anchor,
             bounds=bounds,
             random_state=self.random_state,
             top_sample=self.top_sample
