@@ -22,6 +22,7 @@ except:
 from collections import deque
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
+from sklearn.svm import SVC
 from scipy import stats
 
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel
@@ -100,7 +101,7 @@ class KernelSpace(object):
             theta = initial_theta  # initialize the vector
             m_t, v_t, t = np.zeros_like(initial_theta), np.zeros_like(initial_theta), 0
 
-            for t in range(1, 100):
+            for t in range(1, 200):
                 minus_log_likelihood, g_t = obj_func(theta)  # computes the minus gradient of the stochastic function
                 m_t = beta_1 * m_t + (1 - beta_1) * g_t  # updates the moving averages of the gradient
                 v_t = beta_2 * v_t + (1 - beta_2) * (g_t * g_t)  # updates the moving averages of the squared gradient
@@ -340,6 +341,7 @@ class KernelSpace(object):
                                4 if self.dim < 60 else\
                                5
         self.cluster_num_cap = min(self.cluster_num_cap + int(self._n_iter/4000), 8)
+        self.cluster_allow_new = 4
 
         self.begin_time = datetime.now()
         self.debug = False
@@ -1458,27 +1460,88 @@ class KernelSpace(object):
 
         self._full_params, self._full_targets = self.data_cluster_array[self.index_partition]
 
-    def help_sweep_partition(self):
+    def help_sweep_partition_by_k_means(self):
         self.data_cluster_array = [None] * self.cluster_num
 
-        if self.progress() < 0.5 and self.cluster_num < min(self.cluster_num_cap, 4):
+        if self.progress() < 0.5 and self.cluster_num < min(self.cluster_num_cap, self.cluster_allow_new):
             if self.cluster_num >= 3:
-                center_params, center_targets, data_clusters = \
-                    self.k_means(self._full_params, self._full_targets, self.cluster_num-1, concate=True)
-                sorted_indexes = np.argsort(-center_targets)  # largest target first
-                for i in range(self.cluster_num-1):
-                    self.data_cluster_array[i] = data_clusters[_hashable(center_params[sorted_indexes[i]])]
+                center_params, _, data_clusters = \
+                   self.k_means(self._full_params, self._full_targets, self.cluster_num-1, concate=True)
+                for i in range(self.cluster_num - 1):
+                   self.data_cluster_array[i] = data_clusters[_hashable(center_params[i])]
             elif self.cluster_num == 2:
                 self.data_cluster_array[0] = (self._full_params, self._full_targets)
 
-            self.data_cluster_array[self.cluster_num-1] = (np.empty(shape=(0, self.dim)), np.empty(shape=(0,)))
+            self.data_cluster_array[self.cluster_num - 1] = (np.empty(shape=(0, self.dim)), np.empty(shape=(0,)))
 
         else:
-            center_params, center_targets, data_clusters = \
-                self.k_means(self._full_params, self._full_targets, self.cluster_num, concate=True)
-            sorted_indexes = np.argsort(-center_targets)  # largest target first
+            center_params, _, data_clusters = \
+               self.k_means(self._full_params, self._full_targets, self.cluster_num, concate=True)
             for i in range(self.cluster_num):
-                self.data_cluster_array[i] = data_clusters[_hashable(center_params[sorted_indexes[i]])]
+               self.data_cluster_array[i] = data_clusters[_hashable(center_params[i])]
+
+    def help_sweep_partition(self):
+        self.data_cluster_array = [None] * self.cluster_num
+
+        if self.progress() < 0.5 and self.cluster_num < min(self.cluster_num_cap, self.cluster_allow_new):
+            if self.cluster_num >= 3:
+                data_clusters = self.svm_by_kmeans_y(self._full_params, self._full_targets, self.cluster_num - 1)
+                for i in range(self.cluster_num - 1):
+                    self.data_cluster_array[i] = data_clusters[i]
+            elif self.cluster_num == 2:
+                self.data_cluster_array[0] = (self._full_params, self._full_targets)
+
+            self.data_cluster_array[self.cluster_num - 1] = (np.empty(shape=(0, self.dim)), np.empty(shape=(0,)))
+
+        else:
+            self.data_cluster_array = self.svm_by_kmeans_y(self._full_params, self._full_targets, self.cluster_num)
+
+    def svm_by_kmeans_y(self, X, y, cluster):
+        max_margin = None
+        max_labels = None
+        if len(y) > cluster * 6:
+            expand = 6
+        else:
+            expand = 1
+
+        cluster_expand = cluster * expand
+        for _ in range(5):
+            kmeans = KMeans(n_clusters=cluster_expand).fit(y[:, None])
+            labels = kmeans.labels_
+
+            max_y_cluster = np.empty(shape=(cluster_expand,))
+            for i in np.arange(cluster_expand):
+                tmp_bool = labels == i
+                max_y_cluster[i] = np.max(y[tmp_bool])
+            sorted_indexes = np.argsort(-max_y_cluster)  # largest target first
+            max_y_cluster = max_y_cluster[sorted_indexes]
+            labels = sorted_indexes[labels]
+            margin = 0
+            for i in np.arange(0, cluster_expand - 1):
+                margin += max_y_cluster[i] - max_y_cluster[i + 1]
+            margin /= cluster_expand
+            # merge into smaller clusters
+            labels = np.floor(labels/expand).astype(int)
+            # keep the one with the max_margin
+            if max_margin is None or margin > max_margin:
+                max_margin = margin
+                max_labels = labels
+
+        model = SVC(kernel='poly', gamma='scale', C=100, max_iter=10 ** 6)
+        model.fit(X, max_labels)
+
+        data_cluster_array = [None] * cluster
+        c_labels = model.predict(X)
+        max_cluster = np.empty(shape=(cluster,))
+        for i in np.arange(cluster):
+            index_i = c_labels == i
+            y_sub = y[index_i]
+            max_cluster[i] = np.max(y_sub)
+            data_cluster_array[i] = (X[index_i], y_sub)
+        descend_indexes = np.argsort(-max_cluster)  # largest cluster first
+        data_cluster_array = [data_cluster_array[i] for i in descend_indexes]
+
+        return data_cluster_array
 
     def set_random_anchor(self):
         multi = self.stay_max if not self.small_trial() else min(self.stay_max, 2)
@@ -1906,8 +1969,12 @@ class KernelSpace(object):
         if self._gp_default:
             params['k1__constant_value'] = self.k1_constant_value
             params['k1__constant_value_bounds'] = "fixed"
-            params['k2__length_scale'] = stats.gmean(self.k2_length_scale[k_indexes])
-            params['k2__length_scale_bounds'] = self.length_scale_bound
+            if len(k_indexes) <= 3:
+                params['k2__length_scale'] = self.k2_length_scale[k_indexes]
+                params['k2__length_scale_bounds'] = self.k2_length_scale_bounds[k_indexes]
+            else:
+                params['k2__length_scale'] = stats.gmean(self.k2_length_scale[k_indexes])
+                params['k2__length_scale_bounds'] = self.length_scale_bound
             n = len(k_indexes)
             r_num = 6 if n < 5 else\
                     5 if n < 10 else\
@@ -2092,22 +2159,26 @@ class KernelSpace(object):
                 return True
 
         if self.dim > 5:
-            cap = 150 if self.large_trial() else 70
+            cap = 130 if self.large_trial() else 80
             cap = min(250, int((1.0 + 0.1 * self.num_restart_space) * cap))
             if self.dim <= 20:
-                cap = int(1.9*cap)
+                cap = int(1.6*cap)
         else:
-            cap = 80 if self.large_trial() else 50 if not self.small_trial() else 25
+            cap = 70 if self.large_trial() else 40 if not self.small_trial() else 20
+
+        if 2 <= self.cluster_num < self.cluster_allow_new and self.index_partition == self.cluster_num - 1:
+            cap = int(cap * 0.6)
 
         return self._slowness >= min(0.15*self._n_iter, cap)
 
     def enough_trials_for_one_partition(self):
         if self.data_cluster_array is None \
               or self.index_partition == 0 \
-              or self._global_max_target == self._max_target:
+              or self._global_max_target == self._max_target\
+              or 2 <= self.cluster_num < self.cluster_allow_new and self.index_partition == self.cluster_num - 1:
             return False
         else:
-            cap = 160 if self.large_trial() else 80
+            cap = 160 if self.large_trial() else 80 if not self.small_trial() else 30
             if self.big_improve:
                 self.partition_base_time += 5
             return self.iteration - self.restart_at_iteration > \
