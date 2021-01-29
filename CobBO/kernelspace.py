@@ -1,10 +1,10 @@
 import os
 #must set these before loading numpy:
-os.environ["OMP_NUM_THREADS"] = '4' # export OMP_NUM_THREADS=4
-os.environ["OPENBLAS_NUM_THREADS"] = '4' # export OPENBLAS_NUM_THREADS=4
-os.environ["MKL_NUM_THREADS"] = '6' # export MKL_NUM_THREADS=6
-os.environ["VECLIB_MAXIMUM_THREADS"] = '4' # export VECLIB_MAXIMUM_THREADS=4
-os.environ["NUMEXPR_NUM_THREADS"] = '6' # export NUMEXPR_NUM_THREADS=6
+os.environ["OMP_NUM_THREADS"] = '2'
+os.environ["OPENBLAS_NUM_THREADS"] = '2'
+os.environ["MKL_NUM_THREADS"] = '2'
+os.environ["VECLIB_MAXIMUM_THREADS"] = '2'
+os.environ["NUMEXPR_NUM_THREADS"] = '2'
 
 import numpy as np
 
@@ -101,7 +101,7 @@ class KernelSpace(object):
             theta = initial_theta  # initialize the vector
             m_t, v_t, t = np.zeros_like(initial_theta), np.zeros_like(initial_theta), 0
 
-            for t in range(1, 200):
+            for t in range(1, 1000):
                 minus_log_likelihood, g_t = obj_func(theta)  # computes the minus gradient of the stochastic function
                 m_t = beta_1 * m_t + (1 - beta_1) * g_t  # updates the moving averages of the gradient
                 v_t = beta_2 * v_t + (1 - beta_2) * (g_t * g_t)  # updates the moving averages of the squared gradient
@@ -180,7 +180,7 @@ class KernelSpace(object):
         self.gradient = None
         self.num_item_gp_smoothing = 0
         self.rbfx = None
-        self.rbfx_bounds = None
+        #self.rbfx_bounds = None
         self.reuse_rbfx = False
         self.rbf_smooth = 0.02
         self.gp_reuse = 0
@@ -328,7 +328,7 @@ class KernelSpace(object):
         self.option = 0
         self.rbfx_used_num = 0
         self.rbfx_get_top_k_times = 0
-        self.rbfx_use_cap = 1
+        self.rbfx_use_cap = 0
 
         self.num_restart_space = 0.0
 
@@ -430,6 +430,11 @@ class KernelSpace(object):
                 x_probe_list, k_indexes = self.do_suggestion(self.util_list[self.util_id])
 
             if x_probe_list is None:
+                if self.rd_sample_queue_is_empty():
+                    if self._anchor is not None and len(self._anchor) > 0:
+                        self.add_random_points(add_num=1, option=1)
+                    else:
+                        self.add_random_points(add_num=1, option=0)
                 self.enqueue_new_X()
             else:
                 for x_probe in x_probe_list:
@@ -532,11 +537,6 @@ class KernelSpace(object):
         if not self.open_fast_trust_region or self._anchor is None or len(self._anchor) == 0:
             return
 
-        if self.with_random_anchor():
-            if len(self._bounds_stack_extra) >= 1:
-                self.pop_halve_bounds()
-            return
-
         # Apply fast trust region
         self.update_l_g_cap()
 
@@ -572,10 +572,11 @@ class KernelSpace(object):
             return
         delta /= self.stay_max
         if can_improve:
-            ratio = 1.0 if self.dim <= 250 else 2.0
-            self._probability[k_indexes] *= (1.0 + ratio * delta)
+            alpha = 4.0 if self.large_trial() else 1.5
+            self._probability[k_indexes] *= (1.0 + alpha * delta)
         else:
-            self._probability[k_indexes] *= 1/(1.0 + 4.0*delta)
+            beta = 0.5 if self.large_trial() else 2.0
+            self._probability[k_indexes] *= 1/(1.0 + beta * delta)
         self._probability = normalize_probability(self._probability)
 
     def select_k_indexes_round_robin(self):
@@ -794,9 +795,9 @@ class KernelSpace(object):
             if target > self._max_target + 0.01 * abs(target):
                 self._slowness = 0
             elif target > self._max_target + 0.005 * abs(target):
-                self._slowness = int(self._slowness * 0.5)
+                self._slowness = int(self._slowness * 0.1)
             elif target > self._max_target + 0.001 * abs(target):
-                self._slowness = int(self._slowness * 0.4)
+                self._slowness = int(self._slowness * 0.2)
             else:
                 self._slowness = int(self._slowness * 0.3)
 
@@ -1543,28 +1544,6 @@ class KernelSpace(object):
 
         return data_cluster_array
 
-    def set_random_anchor(self):
-        multi = self.stay_max if not self.small_trial() else min(self.stay_max, 2)
-        cycle = 5 * multi
-
-        if np.mod(self.iteration, cycle) < cycle-1 and self.with_random_anchor():
-            return
-
-        self.cycle_for_rd_anchor += 1
-        if np.mod(self.cycle_for_rd_anchor, 6) <= 1:
-            self._anchor_last = self._anchor
-            self._anchor = self.prepare_random_anchor_far()
-        else:
-            self._anchor_last = self._anchor
-            self._anchor = self.prepare_random_anchor_near()
-
-        if not self.with_random_anchor():
-            self.reduce_domain_for_random_anchor(ratio=0.8)
-            self.rd_anchor_index += 1
-
-        self.merge_random_anchor_iteration = self.iteration + cycle + 1
-        self.done_reset_random_anchor = False
-
     def reduce_domain_for_random_anchor(self, ratio=0.8):
         self.reset_bounds()
         self._bounds = self.do_shrink_bounds(ratio=ratio)
@@ -1572,12 +1551,6 @@ class KernelSpace(object):
         indexes = np.array(list(map(lambda x:self.is_in_domain(x, self._bounds), self._full_params)))
         self._params = self._full_params[indexes]
         self._targets = self._full_targets[indexes]
-
-    def reset_random_anchor(self):
-        self._anchor_last = self._anchor
-        self._anchor = self._max_param
-        self.move_center_by_anchor_param()
-        self.done_reset_random_anchor = True
 
     def k_means(self, params, targets, cluster_num, concate=True, normalize=True, use_centers=False):
         """the output new_params are sorted in descending order in new_targets"""
@@ -1706,11 +1679,10 @@ class KernelSpace(object):
         self.reset_param_target()
         self.filter_data_by_bounds()
 
-    def help_suggest_reset_random_anchor(self):
-        if not self.with_random_anchor() and not self.done_reset_random_anchor:
-            self.reset_random_anchor()
-
     def help_suggest_may_set_random_anchor(self):
+
+        if self.with_random_anchor():
+            return
 
         if not self.with_random_anchor() and not self.done_reset_random_anchor:
             self.reset_random_anchor()
@@ -1720,31 +1692,43 @@ class KernelSpace(object):
         if self._consecutive_fails < trigger_warping_level:
             self.set_record_rd_level = False
 
-        elif self._consecutive_fails >= trigger_warping_level:
+        else:
             if not self.set_record_rd_level:
                 self.set_record_rd_level = True
                 self.bench_level_rd_anchor = self._consecutive_fails
 
             step = 30*self.stay_max
+            if self._n_iter < 700:
+                step = int(step * 0.5)
             ratio = 0.2 + 0.1 * min(self._consecutive_fails/300, 1.0)
             rd = int(step*ratio)
             count = np.mod(self._consecutive_fails - self.bench_level_rd_anchor, step)
 
-            if self.progress() <= 0.9 and count <= rd and not self.with_random_anchor():
+            if self.progress() <= 0.9 and count <= rd:
                 self.set_random_anchor()
 
-    def help_suggest_add_points_if_less_than_level(self):
-
-        add_rd_level = 20 if self.large_trial() else np.clip(self._n_iter//100, 4, 10)
-        if len(self.target) <= add_rd_level and\
-                self.iteration >= self.init_points:
-            if self._anchor is not None and len(self._anchor) > 0:
-                self.add_random_points(add_num=add_rd_level, option=1)
-            else:
-                self.add_random_points(add_num=add_rd_level, option=0)
-            return True
+    def set_random_anchor(self):
+        self.cycle_for_rd_anchor += 1
+        if np.mod(self.cycle_for_rd_anchor, 6) <= 1:
+            self._anchor_last = self._anchor
+            self._anchor = self.prepare_random_anchor_far()
         else:
-            return False
+            self._anchor_last = self._anchor
+            self._anchor = self.prepare_random_anchor_near()
+
+        self.reduce_domain_for_random_anchor(ratio=0.8)
+        self.rd_anchor_index += 1
+
+        multi = self.stay_max if not self.small_trial() else min(self.stay_max, 2)
+        cycle = 5 * multi
+        self.merge_random_anchor_iteration = self.iteration + cycle + 1
+        self.done_reset_random_anchor = False
+
+    def reset_random_anchor(self):
+        self._anchor_last = self._anchor
+        self._anchor = self._max_param
+        self.move_center_by_anchor_param()
+        self.done_reset_random_anchor = True
 
     def help_est_filter_data_by_margin_dec(self, ratio):
         data_points = self._full_params
@@ -1871,7 +1855,7 @@ class KernelSpace(object):
         if self.dim <= 25 and self._n_iter <= 300:
             threshold = max(threshold // 2, 8)
         begin_level = int(threshold * 0.25)
-        trigger_level = int(threshold * 0.4)
+        trigger_level = int(threshold * 0.35)
         if self._fails >= begin_level + threshold:
             if self._fails < begin_level + threshold + trigger_level or self.in_local_mode():
                 k = 1 if np.mod(self._fails - begin_level - threshold, 6) < 3 else self.dim
@@ -1969,7 +1953,7 @@ class KernelSpace(object):
         if self._gp_default:
             params['k1__constant_value'] = self.k1_constant_value
             params['k1__constant_value_bounds'] = "fixed"
-            if len(k_indexes) <= 3:
+            if len(k_indexes) < 3:
                 params['k2__length_scale'] = self.k2_length_scale[k_indexes]
                 params['k2__length_scale_bounds'] = self.k2_length_scale_bounds[k_indexes]
             else:
@@ -2002,6 +1986,49 @@ class KernelSpace(object):
                     self.length_scale_bound[0], \
                     self.length_scale_bound[1])
             self.k1_constant_value = self._gp.kernel_.get_params()['k1__constant_value']
+
+    def opt_multisample(self, k_indexes):
+        self.top_sample = 1
+        progress = self.progress()
+        if len(k_indexes) < 5:
+            if np.mod(self._consecutive_fails, 20) < 10:
+                self.multisample = 1
+            else:
+                self.multisample = 2
+        else:
+            if self._consecutive_fails > 20:
+                if self.large_trial():
+                    self.multisample = 4
+                    self.top_sample = 5 + int(self._consecutive_fails/15) if self.dim > 20 else\
+                                      3 + int(self._consecutive_fails/20)
+                else:
+                    if self._n_iter >= 800:
+                        self.multisample = 3
+                    else:
+                        if np.mod(self._consecutive_fails, 10) < 5:
+                            self.multisample = 1
+                        else:
+                            self.multisample = 2
+            else:
+                if self._consecutive_fails < 10:
+                    self.multisample = 1
+                elif len(self) > 400 or not self._gp_default:
+                    if self.large_trial() and progress < 0.9:
+                        self.multisample = 4
+                        self.top_sample = 4 if self.dim > 20 else 2
+                    else:
+                        if self._n_iter >= 800:
+                            self.multisample = 3
+                        else:
+                            if self._consecutive_fails >= 15:
+                                self.multisample = 1
+                            else:
+                                self.multisample = 2
+                else:
+                    if len(k_indexes) > 25 or self._consecutive_fails >= 15:
+                        self.multisample = 1
+                    else:
+                        self.multisample = 2
 
     def suggest_by_cob(self, utility_function):
 
@@ -2050,7 +2077,7 @@ class KernelSpace(object):
 
         params = self.in_unit_cube(params, k_indexes)
 
-        if len(k_indexes) <= 20 or np.mod(self._consecutive_fails, 20) < 10 and len(k_indexes) <= 30:
+        if len(k_indexes) <= 5 or np.mod(self._consecutive_fails, 20) < 10 and len(k_indexes) <= 30:
             self._gp_default = True
         else:
             self._gp_default = False
@@ -2069,35 +2096,11 @@ class KernelSpace(object):
             print("step 3: gp.fit time=", (datetime.now() - self.begin_time).total_seconds())
             self.begin_time = datetime.now()
 
-        self.top_sample = 1
-        progress = self.progress()
-        if len(k_indexes) < 5:
-            if np.mod(self._consecutive_fails, 20) < 10:
-                self.multisample = 1
-            else:
-                self.multisample = 2
+        if self.batch <= 1:
+            self.opt_multisample(k_indexes)
         else:
-            if self._consecutive_fails > 20:
-                if self.large_trial():
-                    self.multisample = 4
-                    self.top_sample = 5 + int(self._consecutive_fails/15) if self.dim > 20 else\
-                                      3 + int(self._consecutive_fails/20)
-                else:
-                    self.multisample = 3
-            else:
-                if self._consecutive_fails < 10:
-                    self.multisample = 1
-                elif len(self) > 400 or not self._gp_default:
-                    if self.large_trial() and progress < 0.9:
-                        self.multisample = 4
-                        self.top_sample = 4 if self.dim > 20 else 2
-                    else:
-                        self.multisample = 3
-                else:
-                    if len(k_indexes) > 25 or self._consecutive_fails >= 15:
-                        self.multisample = 1
-                    else:
-                        self.multisample = 2
+            self.multisample = 4
+            self.top_sample = self.batch - 1
 
         bounds = (self.bounds[k_indexes]-self._original_bounds[k_indexes, 0][:, None])\
                  /(self._original_bounds[k_indexes, 1][:, None] - self._original_bounds[k_indexes, 0][:, None])
@@ -2150,6 +2153,19 @@ class KernelSpace(object):
 
         return self.suggest_by_cob(utility_function)
 
+    def help_suggest_add_points_if_less_than_level(self):
+
+        add_rd_level = 20 if self.large_trial() else np.clip(self._n_iter//100, 4, 10)
+        if len(self.target) <= add_rd_level and\
+                self.iteration >= self.init_points:
+            if self._anchor is not None and len(self._anchor) > 0:
+                self.add_random_points(add_num=add_rd_level, option=1)
+            else:
+                self.add_random_points(add_num=add_rd_level, option=0)
+            return True
+        else:
+            return False
+
     def too_many_consecutive_fails_condition(self):
         if self.progress() > 0.75:
             if self.data_cluster_array is None or \
@@ -2159,17 +2175,17 @@ class KernelSpace(object):
                 return True
 
         if self.dim > 5:
-            cap = 130 if self.large_trial() else 80
+            cap = 140 if self.large_trial() else 70
             cap = min(250, int((1.0 + 0.1 * self.num_restart_space) * cap))
             if self.dim <= 20:
-                cap = int(1.6*cap)
+                cap = int(1.5*cap)
         else:
-            cap = 70 if self.large_trial() else 40 if not self.small_trial() else 20
+            cap = 80 if self.large_trial() else 40 if not self.small_trial() else 20
 
         if 2 <= self.cluster_num < self.cluster_allow_new and self.index_partition == self.cluster_num - 1:
             cap = int(cap * 0.6)
 
-        return self._slowness >= min(0.15*self._n_iter, cap)
+        return self._slowness >= max(min(0.3*self._n_iter, cap), 30)
 
     def enough_trials_for_one_partition(self):
         if self.data_cluster_array is None \
@@ -2204,8 +2220,7 @@ class KernelSpace(object):
         # Shrink the original_bounds at the last stage of trials
         progress = self.progress()
         if progress > 0.75 and self.iteration >= self.iter_can_shrink_space:
-            ratio = 0.8-(progress-0.75)*1.5
-            self.shrink_total_space(ratio=ratio)
+            self.shrink_total_space()
             self.iter_can_shrink_space = self.iteration + max(int(0.1 * self._n_iter), 25)
 
         # Filter out data points if too many are in the current space
@@ -2218,8 +2233,8 @@ class KernelSpace(object):
         if not self.with_random_anchor():
             self.slow_trust_region()
             self.modify_max_if_many_fails()
+            self.fast_trust_region()
 
-        self.fast_trust_region()
         suggest_list, k_indexes = self.coordi_bo(utility_function)
 
         if suggest_list is not None and len(suggest_list) > 0:
@@ -2264,7 +2279,7 @@ class KernelSpace(object):
                     print("local-new_target rbfx exceeds UPPER BOUND", \
                            'max(new_target)=', max(new_target), 'copula_max=', targets_max)
         else: # option == 1:
-            new_target = self.idw_tree(project_data_points)
+            new_target = self.idw_tree(project_data_points, k=4)
 
         new_data_points = select_data_points[:, k_indexes]
         if len(same_data_index) > 0:
@@ -2330,23 +2345,19 @@ class KernelSpace(object):
         if not self.reuse_rbfx:
             data = self.in_unit_cube(data, range(self.dim))
             rbfx_last = self.rbfx
-            rbfx_bounds_last = self.rbfx_bounds
-            if not self.large_trial() or self.option == 1 and not self.reuse_rbfx:
+            if np.mod(self._consecutive_fails, 5) != 4 or self.option == 1:
                 try:
                     epsilon = self.estimate_epsilon(data, enough_points, margin_ratio)
                     self.rbfx = Rbf(*data.T, target, epsilon=epsilon, smooth=self.rbf_smooth, norm=lambda X, Y: self.norm_p(X, Y))
-                    self.rbfx_bounds = np.copy(self.bounds)
                     self.option = 0
                 except:
                     self.option = 1
                     self.idw_tree = Tree(data, target)
                     self.rbfx = rbfx_last
-                    self.rbfx_bounds = rbfx_bounds_last
             else:
                 self.option = 1
                 self.idw_tree = Tree(data, target)
                 self.rbfx = rbfx_last
-                self.rbfx_bounds = rbfx_bounds_last
 
     def norm_p(self, X, Y):
         if X.shape != Y.shape:
@@ -2446,10 +2457,13 @@ class KernelSpace(object):
         return self._n_iter - self.iteration > 300
 
     def large_trial(self):
-        return self._n_iter > 2000
+        return self._n_iter > 1000
+
+    def medium_trial(self):
+        return 300 <= self._n_iter <= 1000
 
     def small_trial(self):
-        return self._n_iter <= 200
+        return self._n_iter < 300
 
     def budget(self):
         return self._n_iter - self.iteration

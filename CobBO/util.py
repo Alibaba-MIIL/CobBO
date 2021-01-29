@@ -6,7 +6,7 @@ from copy import deepcopy
 
 def ts_sampling(ac, gp, y_max, x_max, bounds, random_state, top_sample=1):
     dim = bounds.shape[0]
-    sample = np.clip(150*dim, 500, 2500)
+    sample = np.clip(200*dim, 500, 3000)
     bounds = shrink_bounds_around_pmax(bounds, x_max)
     with warnings.catch_warnings(record=True) as w:
         x_tries = random_state.uniform(bounds[:, 0], bounds[:, 1], size=(sample, dim))
@@ -46,8 +46,8 @@ def l_bfgs_b(ac, gp, y_max, bounds, random_state, n_warmup):
             res = minimize(lambda x: -ac(x.reshape(1, -1), gp=gp, y_max=y_max),
                            x_seed,
                            bounds=bounds,
-                           method="L-BFGS-B")
-                           #options={'maxiter': 500, 'disp': False})
+                           method="L-BFGS-B",
+                           options={'maxiter': 9000, 'disp': False})
             if res.success:
                 point = res.x
                 value = -res.fun[0]
