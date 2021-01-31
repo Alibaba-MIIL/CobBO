@@ -2148,20 +2148,21 @@ class KernelSpace(object):
         if self._anchor is not None and not self.is_in_domain(self._anchor, self.bounds):
             self.move_center_by_anchor_param()
 
-        if self.help_suggest_add_points_if_less_than_level():
+        if self.help_suggest_add_points_if_anchorNone_or_less_than_level():
             return None, None
 
         return self.suggest_by_cob(utility_function)
 
-    def help_suggest_add_points_if_less_than_level(self):
+    def help_suggest_add_points_if_anchorNone_or_less_than_level(self):
+
+        if self._anchor is None or len(self._anchor) == 0:
+            self.add_random_points(add_num=1, option=0)
+            return True
 
         add_rd_level = 20 if self.large_trial() else np.clip(self._n_iter//100, 4, 10)
         if len(self.target) <= add_rd_level and\
                 self.iteration >= self.init_points:
-            if self._anchor is not None and len(self._anchor) > 0:
-                self.add_random_points(add_num=add_rd_level, option=1)
-            else:
-                self.add_random_points(add_num=add_rd_level, option=0)
+            self.add_random_points(add_num=add_rd_level, option=0)
             return True
         else:
             return False
