@@ -101,7 +101,8 @@ class KernelSpace(object):
             theta = initial_theta  # initialize the vector
             m_t, v_t, t = np.zeros_like(initial_theta), np.zeros_like(initial_theta), 0
 
-            for t in range(1, 1000):
+            maxiter_adam = 1000 if len(bounds) <= 10 else 500
+            for t in range(1, maxiter_adam):
                 minus_log_likelihood, g_t = obj_func(theta)  # computes the minus gradient of the stochastic function
                 m_t = beta_1 * m_t + (1 - beta_1) * g_t  # updates the moving averages of the gradient
                 v_t = beta_2 * v_t + (1 - beta_2) * (g_t * g_t)  # updates the moving averages of the squared gradient
@@ -572,10 +573,10 @@ class KernelSpace(object):
             return
         delta /= self.stay_max
         if can_improve:
-            alpha = 4.0 if self.large_trial() else 1.5
+            alpha = 4.0 if self.dim >= 30 else 2.0
             self._probability[k_indexes] *= (1.0 + alpha * delta)
         else:
-            beta = 0.5 if self.large_trial() else 2.0
+            beta = 1.0 if self.dim >= 30 else 2.0
             self._probability[k_indexes] *= 1/(1.0 + beta * delta)
         self._probability = normalize_probability(self._probability)
 
@@ -1951,15 +1952,15 @@ class KernelSpace(object):
     def _gp_before_fit(self, k_indexes):
         params = self._gp.kernel.get_params()
         if self._gp_default:
-            params['k1__constant_value'] = self.k1_constant_value
+            params['k1__constant_value'] = 1.0
             params['k1__constant_value_bounds'] = "fixed"
-            if len(k_indexes) < 3:
+            n = len(k_indexes)
+            if n < 3:
                 params['k2__length_scale'] = self.k2_length_scale[k_indexes]
                 params['k2__length_scale_bounds'] = self.k2_length_scale_bounds[k_indexes]
             else:
                 params['k2__length_scale'] = stats.gmean(self.k2_length_scale[k_indexes])
                 params['k2__length_scale_bounds'] = self.length_scale_bound
-            n = len(k_indexes)
             r_num = 6 if n < 5 else\
                     5 if n < 10 else\
                     4 if n < 15 else\
@@ -2346,7 +2347,7 @@ class KernelSpace(object):
         if not self.reuse_rbfx:
             data = self.in_unit_cube(data, range(self.dim))
             rbfx_last = self.rbfx
-            if np.mod(self._consecutive_fails, 5) != 4 or self.option == 1:
+            if np.mod(self._consecutive_fails, 6) < 5 or self.option == 1:
                 try:
                     epsilon = self.estimate_epsilon(data, enough_points, margin_ratio)
                     self.rbfx = Rbf(*data.T, target, epsilon=epsilon, smooth=self.rbf_smooth, norm=lambda X, Y: self.norm_p(X, Y))

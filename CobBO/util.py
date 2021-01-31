@@ -6,18 +6,20 @@ from copy import deepcopy
 
 def ts_sampling(ac, gp, y_max, x_max, bounds, random_state, top_sample=1):
     dim = bounds.shape[0]
-    sample = np.clip(200*dim, 500, 3000)
+    sample = np.clip(200*dim, 1000, 5000)
     bounds = shrink_bounds_around_pmax(bounds, x_max)
     with warnings.catch_warnings(record=True) as w:
         x_tries = random_state.uniform(bounds[:, 0], bounds[:, 1], size=(sample, dim))
         if x_max is not None and len(x_max) > 0:
-            # perturb
             prob_perturb = np.clip(7.0 / dim, 0.5, 0.9)
             for row in x_tries:
                 mask = np.random.rand(dim) > prob_perturb
                 row[mask] = x_max[mask]
 
-        values = gp.sample_y(x_tries).ravel()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            mean_tries, std_tries = gp.predict(x_tries, return_std=True)
+        values = mean_tries + std_tries*3.0*np.random.normal(size=len(x_tries))
         if top_sample == 1:
             index = values.argmax()
         else:
@@ -47,7 +49,7 @@ def l_bfgs_b(ac, gp, y_max, bounds, random_state, n_warmup):
                            x_seed,
                            bounds=bounds,
                            method="L-BFGS-B",
-                           options={'maxiter': 9000, 'disp': False})
+                           options={'maxiter': 5000, 'disp': False})
             if res.success:
                 point = res.x
                 value = -res.fun[0]
