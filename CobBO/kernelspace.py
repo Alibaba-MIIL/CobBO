@@ -24,6 +24,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
 from scipy import stats
+from scipy.optimize import minimize
 
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel
 from sklearn.gaussian_process import GaussianProcessRegressor
@@ -86,6 +87,13 @@ class KernelSpace(object):
         self.util_id_list = []
 
         # The default optimizer is "fmin_l_bfgs_b"
+        def optimizer_l_bfgs_b(obj_func, initial_theta, bounds):
+            opt_res = minimize(
+                obj_func, initial_theta, method="L-BFGS-B", jac=True,
+                bounds=bounds, options={'maxiter': 5000, 'disp': False})
+            theta_opt, func_min = opt_res.x, opt_res.fun
+            return theta_opt, func_min
+
         # The other GP regressor used for relatively large dimensions is defined below, optimized by adam
         def optimizer(obj_func, initial_theta, bounds):
             # * 'obj_func' is the objective function to be minimized, which
@@ -118,6 +126,7 @@ class KernelSpace(object):
 
         alpha = 1e-4 if not noise else 1e-3
         self.optimizer = optimizer
+        self.optimizer_l_bfgs_b = optimizer_l_bfgs_b
         self.constant_value_bounds = "fixed"
         self.length_scale_bound = (0.005, self.dim ** 0.5)
         self.k1_constant_value = 1.0
@@ -127,7 +136,7 @@ class KernelSpace(object):
             kernel=ConstantKernel(constant_value=1.0, constant_value_bounds=self.constant_value_bounds) \
                    * Matern(nu=2.5, length_scale=0.5, length_scale_bounds=self.length_scale_bound),
             alpha=alpha,
-            optimizer="fmin_l_bfgs_b",
+            optimizer=self.optimizer_l_bfgs_b, #"fmin_l_bfgs_b",
             normalize_y=True,
             n_restarts_optimizer=5,
             random_state=self.random_state,
@@ -1968,7 +1977,7 @@ class KernelSpace(object):
                     2 if n < 25 else\
                     1
             self._gp.n_restarts_optimizer = r_num
-            self._gp.optimizer = "fmin_l_bfgs_b"
+            self._gp.optimizer = self.optimizer_l_bfgs_b #"fmin_l_bfgs_b"
         else:
             params['k1__constant_value'] = self.k1_constant_value
             params['k1__constant_value_bounds'] = self.constant_value_bounds
