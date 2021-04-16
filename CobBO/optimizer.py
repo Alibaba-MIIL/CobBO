@@ -282,7 +282,7 @@ class CobBO(AbstractOptimizer):
         """
         assert isinstance(optimizer, CobBO), ' A CobBO optimizer is expected'
 
-        while optimizer.has_budget:
+        while optimizer.has_budget or optimizer.has_probe_points:
             if not use_real_space:
                 x_probe_list = self.suggest(n_suggestions=self.batch)
                 target_list = [obj_func(**x) for x in x_probe_list]
@@ -294,6 +294,10 @@ class CobBO(AbstractOptimizer):
                 self.observe(x_probe_real_list, target_list)
 
         return self.best_point
+
+    @property
+    def has_probe_points(self):
+        return len(self.space.queue_new_X) != 0
 
     @property
     def has_budget(self):
