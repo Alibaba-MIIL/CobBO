@@ -1,17 +1,20 @@
-# CobBO: Coordinate Backoff Bayesian Optimization
+# CobBO: Coordinate Backoff Bayesian Optimization with two-stage kernels
 Code accompanying the paper:
-> [CobBO: Coordinate Backoff Bayesian Optimization](https://arxiv.org/abs/2101.05147)\
+> [CobBO: Coordinate Backoff Bayesian Optimization with Two-stage Kernels](https://arxiv.org/abs/2101.05147)\
 > Jian Tan, Niv Nayman, Mengchang Wang, Jin Rong.\
 > _arXiv:2101.05147_.
 
-CobBO is a gradient-free Bayesian optimization method, excelling at the maximization of 10 to 300 dimensional black box functions.
-CobBO captures a smooth approximation of the global landscape of black box functions by interpolating the values of 
-queried points projected to randomly selected promising coordinate subspaces. Thus also a smaller query budget is 
-required for Gaussian process regressions applied over the lower dimensional subspaces.
-This approach can be viewed as a variant of coordinate descent, tailored for Bayesian optimization, using a stopping
-rule for backing off from a certain subspace and switching to another coordinate subset.
-Additionally, adaptive trust regions are dynamically formed to expedite the convergence, and stagnant local optima are escaped by switching trust regions. Further smoothness and acceleration are achieved by filtering out clustered queried 
-points.
+CobBO is a gradient-free Bayesian optimization method, excelling at the maximization of 10 to 300 dimensional 
+black box functions by introducing two-stage kernels. In each iteration, the first stage uses a simple and 
+coarse kernel that sacrifices the approximation accuracy for 
+computational efficiency. It captures the global landscape by purposely smoothing away local fluctuations. 
+Then, in the second stage of the same iteration, past observed points in the full space are projected to the 
+selected subspace, and a more sophisticated kernel is applied to estimate the landscape in the selected 
+low dimensional subspace, where the computational cost becomes affordable. 
+To bridge the two stages,  it relies on a stopping rule for backing off from a certain subspace and switching 
+to another coordinate subset. Additionally, adaptive trust regions are dynamically formed to expedite the 
+convergence, and stagnant local optima are escaped by switching trust regions. Further smoothness and acceleration 
+are achieved by filtering out clustered queried points.
 
 <p align="center">
     <img src="images/cobbo.png" alt="cobbo" width="100%">

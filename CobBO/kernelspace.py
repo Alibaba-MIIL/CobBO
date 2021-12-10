@@ -1,5 +1,5 @@
 import os
-#must set these before loading numpy:
+#set these before loading numpy:
 os.environ["OMP_NUM_THREADS"] = '2'
 os.environ["OPENBLAS_NUM_THREADS"] = '2'
 os.environ["MKL_NUM_THREADS"] = '2'
@@ -30,633 +30,229 @@ from scipy.optimize import minimize
 from sklearn.gaussian_process.kernels import Matern, ConstantKernel
 from sklearn.gaussian_process import GaussianProcessRegressor
 
-
 import warnings
 from datetime import datetime
 
 import copy
 
 class KernelSpace(object):
-    def __init__(self, pbounds, n_iter, init_points, batch,
-                 random_state=None, noise=False, open_slow_trust_region=True, open_fast_trust_region=True,
-                 consistent_query=None, restart=False, allow_partition=True):
+    def coordi_bo(self, utility_function):
+        if self._anchor is not None and not self.is_in_domain(self._anchor, self.bounds):
+            self.move_center_by_anchor_param()
 
-        self.random_state = ensure_rng(random_state)
-        self.batch = batch
+        if self.help_suggest_add_points_if_anchorNone_or_less_than_level():
+            return None, None
 
-        # The total number of data points
-        self._n_iter = n_iter
-        self.init_points = init_points
-        self.iteration = 0
+        return self.suggest_by_cob(utility_function)
 
-        self.dim = len(pbounds)
-        self.noise = noise
-        self.open_slow_trust_region = open_slow_trust_region
-        self.open_fast_trust_region = open_fast_trust_region
-        self.consistent_query = consistent_query
-        self.restart = restart
-        self.restart_at_iteration = 0
-        self.can_sample = True if self.dim >= 5 else False
-        self.allow_partition = allow_partition
+    def suggest_by_cob(self, utility_function):
 
-        self.multisample = 1
-        self.fail_change_multisample = 0
-        self.fail_change_multisample_cap = 50 if n_iter > 1000 else 25
+        if self.debug:
+            self.begin_time = datetime.now()
 
-        self.queue_new_X = Queue()
-        self.goodness = None
-        self.util_id = None
-        self.is_rd_sample_list = None
+        params, targets, enough_points = self.params, self.target, True
 
-        kappa, xi = 2.5, 0.0
-        self.kappa = kappa
-        self.util_explore = UtilityFunction(kind='ucb', dim=self.dim, kappa=4.0 * kappa, xi=xi)
-        self.threshold_explore = 2 if self.large_trial() else 5
-        util_ei = UtilityFunction(kind='ei', dim=self.dim, kappa=kappa, xi=xi)
-        util_ucb_1 = UtilityFunction(kind='ucb', dim=self.dim, kappa=kappa, xi=xi)
-        util_ucb_2 = UtilityFunction(kind='ucb', dim=self.dim, kappa=0.8 * kappa, xi=xi)
-        util_ucb_3 = UtilityFunction(kind='ucb', dim=self.dim, kappa=1.2 * kappa, xi=xi)
+        targets = copula_gaussian(targets)
 
-        self.util_list = [util_ei, util_ucb_1, util_ucb_2, util_ucb_3]
-
-        self.util_ind_list = range(len(self.util_list))
-        self.goodness = assign_probability(len(self.util_list))
-
-        self.queue_new_X = Queue()
-
-        self.k_indexes_list = []
-        self.util_id_list = []
-
-        # The default optimizer is "fmin_l_bfgs_b"
-        def optimizer_l_bfgs_b(obj_func, initial_theta, bounds):
-            maxiter = 800 if len(bounds) <= 30 else 30
-            opt_res = minimize(
-                obj_func, initial_theta, method="L-BFGS-B", jac=True,
-                bounds=bounds, options={'maxiter': maxiter, 'disp': False})
-            theta_opt, func_min = opt_res.x, opt_res.fun
-            return theta_opt, func_min
-
-        alpha = 1e-4 if not noise else 1e-3
-        self.optimizer_l_bfgs_b = optimizer_l_bfgs_b
-        self.constant_value_bounds = "fixed"
-        self.length_scale_bound = (0.005, self.dim ** 0.5)
-        self.k1_constant_value = 1.0
-        self.k2_length_scale_bounds = np.repeat([self.length_scale_bound], self.dim, axis=0)
-        self.k2_length_scale = np.ones(self.dim) * 0.5
-        self._gp = GaussianProcessRegressor(
-            kernel=ConstantKernel(constant_value=1.0, constant_value_bounds=self.constant_value_bounds) \
-                   * Matern(nu=2.5, length_scale=0.5, length_scale_bounds=self.length_scale_bound),
-            alpha=alpha,
-            optimizer=self.optimizer_l_bfgs_b,
-            normalize_y=True,
-            n_restarts_optimizer=5,
-            random_state=self.random_state,
-        )
-        self._gp_default = True
-        self._gp_restart_at_iter = 0
-        self.weights = None
-
-        self.has_improve = False
-        self.big_improve = False
-
-        self.increment_sum = 0.0
-        self.increment_num = 0.0
-        self.target_sum = 0.0
-        self.increment_mean = 0.0
-        self.target_mean = 0.0
-        self.increment_exp = 0.0
-        self.target_exp = 0.0
-        self.targets_s_copula = None
-
-        # Get the name of the parameters
-        self._keys = sorted(pbounds)
-
-        # Initially assign uniform distribution for coordinate selection
-        self._probability = assign_probability(self.dim)
-        self._k_indexes = np.arange(self.dim)
-        self._can_change_indexes = False
-
-        # Create an array with parameters bounds
-        self._bounds = np.array(
-            [item[1] for item in sorted(pbounds.items(), key=lambda x: x[0])],
-            dtype=np.float
-        )
-
-        self._original_bounds = np.copy(self._bounds)
-        self._bounds_stack = deque()
-        self._bounds_stack_extra = deque()
-
-        # Pre-allocated memory for X and Y points
-        self._params = np.empty(shape=(0, self.dim))
-        self._targets = np.empty(shape=(0,))
-        self._full_params = np.empty(shape=(0, self.dim))
-        self._full_targets = np.empty(shape=(0,))
-        self.num_partition_space = 0
-        self.partition_base_time = 0
-
-        # The anchor set
-        self.rd_anchor_index = 0
-        self.rd_anchor_set = []
-        self.cycle_for_rd_anchor = 0
-        self.rd_anchor_dis_P25 = 0
-        self.gradient = None
-        self.num_item_gp_smoothing = 0
-        self.gp_reuse = 0
-
-        self._success_after_adj = 0.0
-        self._adj_num = 0
-
-        self.sufficient_improvement = False
-        self.very_close = False
-
-        # Pre-allocate memory for max param and target
-        self._max_param = np.empty(shape=(0, self.dim))
-        self._max_target = float("-inf")
-        self._anchor = self._max_param
-        self._anchor_last = self._max_param
-        self._global_max_param = np.empty(shape=(0, self.dim))
-        self._global_max_target = float("-inf")
-        self._copula_targets_max = float("-inf")
-        self._copula_targets_min = float("-inf")
-
-        # Keep track of unique points observed so far
-        self._cache = {}
-
-        # A queue for suggested data points
-        self._queue = Queue()
-
-        # A counter for the number of consecutive non-improvement trials
-        self._fails = 0
-        self._success = 0
-        self._sub_success = 0
-        self._consecutive_fails = 0
-        self._slowness = 0
-        self._count_success = 0
-        self._modify_max_count = 0
-        self._modify_max_count_3_times = 0
-        self.need_init_sample_iteration = 0
-        self._guard_consecutive_fails = True
-        self._consecutive_local_modes = 0
-        self._local_mode_now = False
-
-        # A counter for the number of tested sub-domain
-        self._tested_other_region_num = 0
-        self._ref_max_num = 0
-        self._time_enter_last_region = 0
-
-        # Round-robin
-        self.sequence = np.arange(self.dim)
-        self.rr_ratio = 0.5
-        self.is_round_robin = False
-        self.ix_for_rr = 0
-        self.stay = 0
-        self.stay_max_base = 5 if self.dim >= 200 else\
-                             4 if self.dim >= 100 else\
-                             3 if self.dim >= 70 else \
-                             2 if self.dim >= 20 else\
-                             1
-        if self.noise:
-            self.stay_max_base += min(self._n_iter//700, 7)
-        else:
-            self.stay_max_base += min(self._n_iter//1000, 3)
-        if self.consistent_query is not None:
-            self.stay_max_base = self.consistent_query
-
-        self.how_often_do_rr = 6 * self.stay_max
-        self.rr_idx = 0
-        self.rr_set = [4, 5, 10, 20]
-        self.rr_condition = False
-
-        # Used for adjust_bounds
-        self.bounds_index = np.random.permutation(self.dim)
-        self.adjust_end = False
-        self.has_reached_max_level = False
-
-        self.coord_group = 1
-
-        self.round = min(int(np.ceil(6/self.coord_group)), 5)
-        self.max_phase = self.round * self.coord_group + 1
-
-        self.not_close = False
-        self.local_bound_ratio = 1.0
-
-        # Threshold of v_clock
-        self.reached_level = 0
-        self.iter_local_cap = 0
-        self.iter_in_local = 0
-        self.iter_global_cap = 0
-        self.iter_in_global = 0
-        self.fail_threshold = 0
-        self.restart_num = 0
-        self.restart_threshold = 1 if self._n_iter < 10000 else 3
-
-        # For modification by median number
-        self.modify_by_median_num = 0
-        self.last_time_modify = 0
-        self.last_time_random_max_scratch = 0
-        self.merge_random_anchor_iteration = 0
-        self.done_reset_random_anchor = False
-        self.iter_can_shrink_space = 0
-
-        # For discarding data
-        self.discard_data_num = 0
-        self.data_num_cap = 900
-
-        self.threshold_cap_base = 15 if self.large_trial() else 12 if self.medium_trial() else 9
-        self.threshold_cap_start = 15 if self.large_trial() else 12 if self.medium_trial() else 9
-
-        self.can_do_rr = (self.dim >= 30) or (self.dim >= 20 and self._n_iter >= 1000)
-
-        self.bench_level_rd_anchor = 0
-        self.set_record_rd_level = False
-
-        self._up_base = 30
-        self.change_max_param_level_base = 0
-        self.change_max_param_level = 0
-        self.rr_condition = False
-
-        self.in_warping_down = False
-        self.time_at_max_level = 0
-
-        self.noneRR_iter = 0
-
-        self.k_candidate_1 = [4, 5, 6, 8] if self.dim <= 10 else \
-                             [7, 8, 9, 11, 12] if self.dim <= 15 else \
-                             [12, 13, 15, 18, 23, 25] if self.dim <= 35 else\
-                             [20, 22, 25, 26, 27, 30]
-
-        self.k_candidate_3 = [2, 3, 4] if self.dim <= 10 else \
-                             [2, 3, 5, 6, 7] if self.dim <= 15 else \
-                             [3, 4, 6, 7, 9, 10] if self.dim <= 35 else\
-                             [4, 6, 7, 9, 11, 12, 15]
-
-        self.sub_params = None
-        self.sub_targets = None
-        self.last_k_indexes = None
-        self.last_eval_num = -1
-        self.eval_num = 0
-
-        self.rbfx = None
-        self.idw_tree = None
-        self.option = 0
-        self.rbfx_used_num = 0
-        self.rbfx_get_top_k_times = 0
-        self.rbfx = None
-        self.reuse_rbfx = False
-        self.rbf_smooth = 0.02
-        self.rbfx_use_cap = 0
-
-        self.num_restart_space = 0.0
-
-        self.last_suggest = None
-
-        self.data_cluster_array = None
-        self.index_partition = -1
-        self.cluster_num = 2
-        self.cluster_num_cap = 3 if self.dim < 20 else\
-                               4 if self.dim < 60 else\
-                               5
-        self.cluster_num_cap = min(self.cluster_num_cap + int(self._n_iter/4000), 8)
-        self.cluster_allow_new = 4
-
-        self.begin_time = datetime.now()
-        self.debug = False
-
-    @property
-    def stay_max(self):
-        stay_max = self.stay_max_base
-        if self.progress() > 0.6:
-            stay_max = max(stay_max-1, 1)
-        return stay_max
-
-    @property
-    def upper_bound(self):
-        if len(self._bounds_stack_extra) >= 1:
-            return int(1.2 * self._up_base)
-        else:
-            return self._up_base
-
-    def update_rr_condition(self):
-        self.rr_condition = self.can_do_rr and \
-                            np.mod(self.iteration, self.how_often_do_rr * self.stay_max + 1) \
-                                   <= self.rr_ratio * self.how_often_do_rr * self.stay_max
-        return self.rr_condition
-
-    def has_unused_trial_budget(self):
-        return self.iteration < self._n_iter
-
-    @property
-    def shrink_ratio(self):
-        ratio_set = [0.5, 0.6]
-        check = np.mod((self._adj_num - 1)//self.coord_group, len(ratio_set))
-        return ratio_set[check]
-
-    @property
-    def threshold_cap(self):
-        pi = 3.1415926 * 0.7
-        return int(self.threshold_cap_start + self.threshold_cap_base * np.sin(pi * self._adj_num / self.max_phase))
-
-    @property
-    def num_round(self):
-        return int(self.dim / self.dim_per_round)
-
-    @property
-    def dim_per_round(self):
-        return min(self.rr_set[self.rr_idx], self.dim//2)
-
-    def progress(self):
-        return self.iteration/self._n_iter
-
-    def impl_suggest_kernel(self, n_suggestions=1):
-        while len(self.queue_new_X) < n_suggestions and self.has_unused_trial_budget():
-            self.enqueue_new_X()
-
-        X_new_list = []
-        self.is_rd_sample_list = []
-        self.k_indexes_list = []
-        self.util_id_list = []
-        i = 0
-        while i < n_suggestions:
-            try:
-                x_probe, is_rd_sample, k_indexes, util_id = next(self.queue_new_X)
-                i += 1
-                X_new_list.append(x_probe)
-                self.is_rd_sample_list.append(is_rd_sample)
-                self.k_indexes_list.append(k_indexes)
-                self.util_id_list.append(util_id)
-            except StopIteration:
-                break
-
-        return X_new_list
-
-    def enqueue_new_X(self):
-        if not self.rd_sample_queue_is_empty():
-            while not self.rd_sample_queue_is_empty():
-                x_probe = next(self._queue)
-                self.queue_new_X.add((x_probe, True, None, None))
-                self.iteration += 1
-
-        else:
-            if self._fails >= 10 and np.mod(self._fails, self.threshold_explore) == 0 and not self.small_trial():
-                self.util_explore.kappa = self.get_kappa()
-                self.util_id = len(self.util_list)
-                x_probe_list, k_indexes = self.do_suggestion(self.util_explore)
+        k_indexes = np.arange(self.dim)
+        if self.can_sample:
+            if self.is_initial_sampling():
+                k = min(self.dim, self.upper_bound)
             else:
-                self.util_id = np.random.choice(self.util_ind_list, p=self.goodness)
-                x_probe_list, k_indexes = self.do_suggestion(self.util_list[self.util_id])
+                k = self.help_suggest_get_k_for_rr_or_normal()
+                k = self.help_suggest_use_small_k_or_dim_for_fails_num_just_above_threshold(k)
 
-            if x_probe_list is None:
-                if self.rd_sample_queue_is_empty():
-                    if self._anchor is not None and len(self._anchor) > 0:
-                        self.add_random_points(add_num=1, option=1)
-                    else:
-                        self.add_random_points(add_num=1, option=0)
-                self.enqueue_new_X()
-            else:
-                for x_probe in x_probe_list:
-                    self.queue_new_X.add((x_probe, False, k_indexes, self.util_id))
-                    self.iteration += 1
+            if k < self.dim:
+                k_indexes = self.select_k_indexes(k)
 
-    def get_kappa(self):
-        x = self._consecutive_fails/23
-        upper = 3.5 if self.large_trial() else 1.0 if self.small_trial() else 2.5
-        ratio = x - np.floor(x/upper) * upper
-        return self.kappa * (1.0 + ratio)
-
-    def adjust_util_goodness(self, util_id, has_improve):
-        if util_id is None or util_id >= len(self.util_list):
-            return
-        if has_improve:
-            self.goodness[util_id] *= 1.05
-        else:
-            self.goodness[util_id] /= 1.01
-        self.goodness = normalize_probability(self.goodness)
-
-    def opt_margin(self):
-        ratio = 0.15 if len(self._bounds_stack_extra) >= 1 else 0.1
-        return ratio
-
-    def in_local_mode(self):
-        return self._local_mode_now
-
-    def update_l_g_cap(self):
-        progress = self.progress()
-
-        if self.small_trial():
-            g_u, l_u, f_u = 4, 4, 4
-        elif self.medium_trial():
-            g_u, l_u, f_u = 6, 6, 8
-        else: #large_trial
-            g_u, l_u, f_u = 16, 12, 16
-
-        step_global = max(2 * self.stay_max, g_u)
-        step_local = max(2 * self.stay_max, l_u)
-        self.fail_threshold = max(4 * self.stay_max, f_u)
-        inc1 = int(0.7 * step_local * progress)
-        inc2 = min( int(self._n_iter//4000), 2 ) * self.stay_max
-
-        self.iter_local_cap = step_local + inc1 + inc2
-        self.iter_global_cap = step_global + inc2
-
-    def inc_local_iter(self):
-        self.iter_in_local += 1
-        if self.iter_in_local >= self.iter_local_cap and len(self) >= 50:
-            self.reset_l_g_iter()
-            self._local_mode_now = False
-
-    def in_global_mode(self):
-        return not self._local_mode_now
-
-    def reset_l_g_iter(self):
-        self.iter_in_global = 0
-        self.iter_in_local = 0
-
-    def inc_global_iter(self, fail_threshold):
-        if self._consecutive_fails < fail_threshold:
-            self._consecutive_local_modes = 0
-        elif self._consecutive_fails == fail_threshold:
-            self._local_mode_now = True
-            self.reset_l_g_iter()
-            self._consecutive_local_modes += 1
-        else:
-            self.iter_in_global += 1
-            if self.iter_in_global >= self.iter_global_cap:
-                self.reset_l_g_iter()
-                self._local_mode_now = True
-                self._consecutive_local_modes += 1
-
-    def shrink_total_space(self, ratio=0.8):
-        print(Colours.blue("shrink_total_space"))
-        if self._adj_num >= 1 or len(self._bounds_stack_extra) >= 1 or self.index_partition >= 0:
-            self.reset_space_to_full_data_and_bounds(merge_partition=True)
-
-        self._max_param = np.copy(self._global_max_param)
-        self._max_target = self._global_max_target
-        self._anchor_last = self._anchor
-        self._anchor = self._max_param
-
-        self._bounds = self.do_shrink_bounds(ratio=ratio)
-        self.rbfx_used_num = self.rbfx_use_cap
-        self.stay = self.stay_max - 1
-        self.filter_data_by_bounds()
-        self._full_params = self._params
-        self._full_targets = self._targets
-        self._original_bounds = np.copy(self._bounds)
-
-    def fast_trust_region(self):
-        if not self.open_fast_trust_region or self._anchor is None or len(self._anchor) == 0:
-            return
-
-        # Apply fast trust region
-        self.update_l_g_cap()
-
-        if self.in_local_mode():
-            # For local_mode
-            self.inc_local_iter()
-            if len(self._bounds_stack_extra) == 0:
-                self.push_halve_bounds(ratio=self.extra_bound_ratio())
-        else:
-            # For global-mode
-            self.inc_global_iter(fail_threshold=self.fail_threshold)
-
-            if len(self._bounds_stack_extra) >= 1:
-                self.pop_halve_bounds()
-
-        return
-
-    def extra_bound_ratio(self):
-        progress = self.progress()
-        factor = 1.0 - 0.5*progress
-
-        ratio_set = [0.7, 0.5]
-        index = np.mod(self._consecutive_local_modes-1, len(ratio_set))
-        ratio = ratio_set[index]
-
-        return ratio * factor
-
-    def half_rr_ratio(self):
-        self.rr_ratio /= 2.0
-
-    def inc_probability(self, k_indexes, can_improve, delta):
-        if k_indexes is None or len(k_indexes) == self.dim:
-            return
-        delta /= self.stay_max
-        if can_improve:
-            alpha = 4.0 if self.dim >= 30 else 2.0
-            self._probability[k_indexes] *= (1.0 + alpha * delta)
-        else:
-            beta = 1.0 if self.dim >= 30 else 2.0
-            self._probability[k_indexes] *= 1/(1.0 + beta * delta)
-        self._probability = normalize_probability(self._probability)
-
-    def select_k_indexes_round_robin(self):
-        ix = self.ix_for_rr
-        if self.in_local_mode():
-            if ix < self.num_round - 2:
-                self._k_indexes = sorted(self.sequence[ix * self.dim_per_round: (ix + 2) * self.dim_per_round])
-            else:
-                self._k_indexes = sorted(self.sequence[(ix - 1) * self.dim_per_round: self.dim])
-        else:
-            if ix < self.num_round - 1:
-                self._k_indexes = sorted(self.sequence[ix * self.dim_per_round: (ix + 1) * self.dim_per_round])
-            else:
-                self._k_indexes = sorted(self.sequence[ix * self.dim_per_round: self.dim])
-
-        self.ix_for_rr = np.mod(self.ix_for_rr + 1, self.num_round)
-        if self.ix_for_rr == 0:
-            try:
-                gradient = self.rbfx.gradient(self.in_unit_cube(self._max_param, range(self.dim)))
-                self.sequence = np.argsort(abs(gradient))
-            except AttributeError:
                 if self.debug:
-                    print("warning: select_k_indexes_round_robin: self.rbfx.gradient is None")
-                pass
-            self.rr_idx = np.mod(self.rr_idx + 1, len(self.rr_set))
+                    self.begin_time = datetime.now()
 
-        return self._k_indexes
+                if self.sub_params is None:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        params, targets = self.esti_virt_points_on_subspace(params, targets,
+                                                    k_indexes, self._anchor, enough_points)
+                        if self.debug:
+                            print("step 2: esti_virt_points_on_subspace time=",
+                                  (datetime.now() - self.begin_time).total_seconds())
+                            self.begin_time = datetime.now()
 
-    def select_k_indexes_weight_update(self, k):
-        if self.dim <= 50:
-            if k >= max(0.2 * float(self.dim), 4) and np.random.random() <= 0.7:
-                self._k_indexes = sorted(np.random.choice(self.dim, k, False, self._probability))
-            else:
-                if np.random.random() < 0.9:
-                    # Descending order
-                    self._k_indexes = sorted(np.argsort(-self._probability)[0:k])
+                    if self.stay_max >= 1:
+                        self.sub_params, self.sub_targets = params, targets
+                        self.targets_s_copula = np.copy(self.target)
                 else:
-                    self._k_indexes = sorted(np.argsort(self._probability)[0:k])
-        else:  # High dim
-            if (k > 20 and np.random.random() <= 0.7) or (k >= 3 and np.random.random() <= 0.25):
-                self._k_indexes = sorted(np.random.choice(self.dim, k, False, self._probability))
+                    params, targets = self.sub_params, self.sub_targets
+
             else:
-                if np.random.random() < 0.9:
-                    # Descending order
-                    self._k_indexes = sorted(np.argsort(-self._probability)[0:k])
-                else:
-                    self._k_indexes = sorted(np.argsort(self._probability)[0:k])
+                self._k_indexes = k_indexes
+                self.sub_params = None
 
-        self.inc_probability(self._k_indexes, False, delta=0.1)
+            self.stay += 1
 
-        return self._k_indexes
+        if params is None or len(params) <= 1 or np.isnan(params).any() or np.isinf(params).any():
+            if self._anchor is not None and len(self._anchor) > 0:
+                self.add_random_points(add_num=3, option=1)
+            else:
+                self.add_random_points(add_num=3, option=0)
+            return None, None
 
-    def estimate_epsilon(self, data_points, enough_points, margin_ratio):
-        # Default epsilon is "the average distance between nodes" based on a bounding hypercube
-        xi = np.asarray([np.asarray(a, dtype=np.float_).flatten() for a in data_points])
-        if len(xi.shape) == 1:
-            xi = xi[None, :]
-        ximax = np.amax(xi, axis=1)
-        ximin = np.amin(xi, axis=1)
-        edges = ximax - ximin
-        edges = edges[edges > 0.01]
-        ratio = 1.0 if self.iteration <= 0.2 * self._n_iter else\
-                0.95 if self.iteration <= 0.5 * self._n_iter else 0.9
-        epsilon = ratio*np.power(np.prod(edges)/len(data_points), 1.0/edges.size)
-        if not enough_points and self.in_local_mode():
-            epsilon *= (1.0 - margin_ratio)
-        epsilon = max(epsilon, 0.0001)
-        progress = 1.0 - 0.1*self.progress()
-        epsilon *= progress
-        return epsilon
+        params = self.in_unit_cube(params, k_indexes)
 
-    def select_k_indexes_gp_smoothing(self, k):
-        if self.rbfx is None:
-            return self.select_k_indexes_gp_smoothing_2(k)
-        gradient = self.rbfx.gradient(self.in_unit_cube(self._anchor, range(self.dim)))
-        self._k_indexes = np.argpartition(abs(gradient), -k)[-k:]
-        return self._k_indexes
-
-    def select_k_indexes_gp_smoothing_2(self, k):
-        if not np.array_equal(self._anchor, self._anchor_last) \
-                or self.gradient is None\
-                or abs(self.num_item_gp_smoothing-len(self._params)) >= 2*self.stay_max:
-            vectors = self.in_unit_cube(self._params, range(self.dim)) \
-                      - self.in_unit_cube(self._anchor, range(self.dim))
-            distances = np.linalg.norm(vectors, ord=0.5, axis=1)
-            md = np.percentile(distances, 35)
-            sub_set = np.where(distances < md)
-            distances = distances[sub_set]
-            vectors = vectors[sub_set]
-            sigma = max(np.percentile(distances, 40), 0.01)
-            targets = self._targets[sub_set]
-            weight = np.exp(-(distances/sigma)**2)
-            value_diff = (self._max_target - targets)/(1.0+abs(self._max_target))
-            weight = np.multiply(value_diff, weight)
-            gradient = np.zeros_like(self._params[0])
-            for u_x, f_x in zip(vectors, weight):
-                gradient += (f_x * u_x)
-
-            self.gradient = gradient
-            self.num_item_gp_smoothing = len(self._params)
-
+        gp_threshold = 20 if not self.small_trial() else 10
+        if np.mod(self._consecutive_fails, gp_threshold) < gp_threshold/2 and len(k_indexes) <= 30:
+            self._gp_default = True
         else:
-            gradient = self.gradient
+            self._gp_default = False
 
-        if sum(abs(gradient)) == 0.0:
-            self._k_indexes = self.select_k_indexes_weight_update(k)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self._gp_before_fit(k_indexes)
+            try:
+                self._gp.fit(params, targets)
+            except ValueError:
+                self.add_random_points(add_num=1, option=0)
+                return None, None
+            self._gp_after_fit(k_indexes)
 
+        if self.debug:
+            print("step 3: gp_defalt=", self._gp_default, "gp.fit time=", (datetime.now() - self.begin_time).total_seconds())
+            self.begin_time = datetime.now()
+
+        if self.batch <= 1:
+            self.opt_multisample(k_indexes)
         else:
-            self._k_indexes = np.argpartition(abs(gradient), -k)[-k:]
-        return self._k_indexes
+            self.multisample = 4
+            self.top_sample = self.batch - 1
+
+        bounds = (self.bounds[k_indexes]-self._original_bounds[k_indexes, 0][:, None])\
+                 /(self._original_bounds[k_indexes, 1][:, None] - self._original_bounds[k_indexes, 0][:, None])
+        anchor = self.in_unit_cube(self._anchor[k_indexes], k_indexes)
+
+        suggestion_subindex_list = acq_max(
+            ac=utility_function.utility,
+            gp=self._gp,
+            multisample=self.multisample,
+            y_max=self._max_target,
+            x_max=anchor,
+            bounds=bounds,
+            random_state=self.random_state,
+            top_sample=self.top_sample
+        )
+
+        suggestion_subindex_list_copy = np.array([self.out_unit_cube(x, k_indexes) for x in suggestion_subindex_list])
+
+        if self.debug:
+            print("step 4: max acquisition, multisample=", self.multisample, "gp_default=", self._gp_default,\
+                  "len(k_index)=", len(k_indexes), "time=", (datetime.now() - self.begin_time).total_seconds())
+            self.begin_time = datetime.now()
+
+        if self.can_sample:
+            suggestion_list = np.empty((len(suggestion_subindex_list_copy), self.dim))
+            for i in range(len(suggestion_list)):
+                suggestion_list[i][k_indexes] = suggestion_subindex_list_copy[i]
+                a = np.arange(self.dim)
+                mask = np.zeros(a.shape, dtype=bool)
+                mask[k_indexes] = True
+                excluded = a[~mask]
+                suggestion_list[i][excluded] = self._anchor[excluded]
+        else:
+            suggestion_list = suggestion_subindex_list_copy
+
+        a = np.arange(len(suggestion_list))
+        mask = np.zeros(a.shape, dtype=bool)
+        for i in a:
+            if suggestion_list[i] not in self:
+                mask[i] = True
+
+        return suggestion_list[mask], k_indexes
+
+    def do_suggestion(self, utility_function):
+        """New points to evaluate"""
+
+        if len(self._full_params) == 0:
+            self.need_init_sample_iteration = self.iteration
+            self.queue_init_X(self.init_points)
+            return None, None
+
+        if self.allow_partition and (not self.long_run_enough_avoid_partitioning()) and \
+                (self.too_many_consecutive_fails_condition() or self.enough_trials_for_one_partition()):
+            self.sweep_partitions()
+            print(Colours.yellow("Repulsive escape at iteration="), self.iteration, \
+                  'in partition index=', self.index_partition, "with", len(self), \
+                  'points from', self.cluster_num, "partitions")
+            return None, None
+
+        # Shrink the original_bounds at the last stage of the whole process
+        progress = self.progress()
+        if progress > 0.75 and self.iteration >= self.iter_can_shrink_space:
+            self.shrink_total_space()
+            self.iter_can_shrink_space = self.iteration + max(int(0.1 * self._n_iter), 25)
+
+        # Filter out data points if too many are in the current space
+        if (len(self) > self.data_num_cap or len(self._full_targets) > 2.0 * self.data_num_cap) \
+                and self._consecutive_fails >= 10 and not self.with_random_anchor():
+            self.discard_data(keep_ratio=0.5, top_ratio=0.2, keep_top=True, modify_top=False)
+
+        self.help_suggest_may_set_random_anchor()
+
+        if not self.with_random_anchor():
+            self.slow_trust_region()
+            self.modify_max_if_many_fails()
+            self.fast_trust_region()
+
+        suggest_list, k_indexes = self.coordi_bo(utility_function)
+
+        if suggest_list is not None and len(suggest_list) > 0:
+            self.last_suggest = suggest_list[0]
+
+        return suggest_list, k_indexes
+
+    def esti_virt_points_on_subspace(self, data_points, targets, k_indexes, anchor, enough_points):
+        if self.debug:
+            self.begin_time = datetime.now()
+
+        self.update_reuse_rbfx(data_points, targets, enough_points, 0.0)
+
+        if self.debug:
+            print("\niteration=", self.iteration, "step 1: update_reuse_rbfx time=", (datetime.now() - self.begin_time).total_seconds())
+            self.begin_time = datetime.now()
+
+        select_data_points, same_data_index = self.project_to_subspace(data_points, targets, k_indexes, anchor)
+
+        if self.debug:
+            print("project_to_subspace time=", (datetime.now() - self.begin_time).total_seconds())
+            self.begin_time = datetime.now()
+
+        if len(select_data_points) == 0 and len(same_data_index) >= 1:
+            return data_points[same_data_index][:, k_indexes], targets[same_data_index]
+
+        project_data_points = self.in_unit_cube(select_data_points, range(self.dim))
+
+        if self.option == 0:
+            new_target = self.rbfx(*project_data_points.T)
+
+            if self.debug:
+                print("rbfx(*project_data_points.T) len(data)=", len(project_data_points), "time=", (datetime.now() - self.begin_time).total_seconds())
+                self.begin_time = datetime.now()
+
+            targets_max = max(targets)
+            if max(new_target) > targets_max:
+                self.rbf_smooth += 0.02
+                self.rbfx_used_num = self.rbfx_use_cap
+
+                if self.debug:
+                    print("local-new_target rbfx exceeds UPPER BOUND", \
+                           'max(new_target)=', max(new_target), 'copula_max=', targets_max)
+        else: # option == 1:
+            new_target = self.idw_tree(project_data_points, k=4)
+
+        new_data_points = select_data_points[:, k_indexes]
+        if len(same_data_index) > 0:
+            np.concatenate([new_data_points, data_points[same_data_index][:, k_indexes]])
+            np.concatenate([new_target, targets[same_data_index]])
+
+        return new_data_points, new_target
 
 
     def select_k_indexes(self, k):
@@ -696,6 +292,45 @@ class KernelSpace(object):
 
         return self._k_indexes
 
+    def project_to_subspace(self, data_points, targets, k_indexes, anchor):
+        a = np.arange(self.dim)
+        mask = np.zeros(a.shape, dtype=bool)
+        mask[k_indexes] = True
+        excluded = a[~mask]
+
+        project_data = []
+        project_value = []
+        same_data_index = []
+        tmp_map = set()
+        for idx, x in enumerate(data_points):
+            y = np.copy(x)
+            if np.all(y[excluded] == anchor[excluded]):
+                same_data_index.append(idx)
+            else:
+                y[excluded] = anchor[excluded]
+                yy = _hashable(y)
+                if yy not in tmp_map:
+                    tmp_map.add(yy)
+                    project_data.append(y)
+                    project_value.append(targets[idx])
+
+        project_data, same_data_index = np.array(project_data), np.array(same_data_index)
+
+        if np.mod(self._consecutive_fails, 20) < 10 and (self.dim < 100 or len(project_data) < 160):
+            return project_data, same_data_index
+
+        else:
+            project_value = np.array(project_value)
+
+            if len(same_data_index) > 200 or len(project_data) <= 1:
+                return [], same_data_index
+            else:
+                ratio = 0.5 if self.dim < 80 else 0.3
+                u_l = 300 if self.dim < 100 else 200
+                top = np.clip(min(len(project_data) - 1, int(ratio * len(data_points))), 1, u_l)
+                ind_top = np.argpartition(project_value, -top)[-top:]
+                project_data = project_data[ind_top]
+                return project_data, same_data_index
 
     def register(self, params, target, is_rd_sample, k_indexes):
 
@@ -855,6 +490,541 @@ class KernelSpace(object):
             self.reached_level = self._adj_num
 
         return self.has_improve
+
+    def impl_suggest_kernel(self, n_suggestions=1):
+        while len(self.queue_new_X) < n_suggestions and self.has_unused_trial_budget():
+            self.enqueue_new_X()
+
+        X_new_list = []
+        self.is_rd_sample_list = []
+        self.k_indexes_list = []
+        self.util_id_list = []
+        i = 0
+        while i < n_suggestions:
+            try:
+                x_probe, is_rd_sample, k_indexes, util_id = next(self.queue_new_X)
+                i += 1
+                X_new_list.append(x_probe)
+                self.is_rd_sample_list.append(is_rd_sample)
+                self.k_indexes_list.append(k_indexes)
+                self.util_id_list.append(util_id)
+            except StopIteration:
+                break
+
+        return X_new_list
+
+    def enqueue_new_X(self):
+        if not self.rd_sample_queue_is_empty():
+            while not self.rd_sample_queue_is_empty():
+                x_probe = next(self._queue)
+                self.queue_new_X.add((x_probe, True, None, None))
+                self.iteration += 1
+
+        else:
+            if self._fails >= 10 and np.mod(self._fails, self.threshold_explore) == 0 and not self.small_trial():
+                self.util_explore.kappa = self.get_kappa()
+                self.util_id = len(self.util_list)
+                x_probe_list, k_indexes = self.do_suggestion(self.util_explore)
+            else:
+                self.util_id = np.random.choice(self.util_ind_list, p=self.goodness)
+                x_probe_list, k_indexes = self.do_suggestion(self.util_list[self.util_id])
+
+            if x_probe_list is None:
+                if self.rd_sample_queue_is_empty():
+                    if self._anchor is not None and len(self._anchor) > 0:
+                        self.add_random_points(add_num=1, option=1)
+                    else:
+                        self.add_random_points(add_num=1, option=0)
+                self.enqueue_new_X()
+            else:
+                for x_probe in x_probe_list:
+                    self.queue_new_X.add((x_probe, False, k_indexes, self.util_id))
+                    self.iteration += 1
+
+    def help_suggest_get_k_for_rr_or_normal(self):
+        self.rr_condition = self.update_rr_condition()
+
+        # Round-robin
+        if self.rr_condition:
+            self.is_round_robin = True
+            k = self.dim_per_round
+
+        else:  #none-RR mode
+            k = self.help_suggest_select_non_RR_mode_k_value()
+            self.is_round_robin = False
+            self.noneRR_iter += 1
+            if self._consecutive_fails > 10 and np.mod(self.noneRR_iter, 5) == 0:
+                k = min(self.dim, self.upper_bound)
+
+        return k
+
+    def help_suggest_select_non_RR_mode_k_value(self):
+
+        p = 0.5 + 0.1 * self.progress() + 0.1 * (self._adj_num / self.max_phase)
+
+        if self.in_local_mode() \
+                or np.random.random() < p:
+            k_candidate_1 = self.k_candidate_1
+            ix1 = np.random.randint(len(k_candidate_1))
+            k = k_candidate_1[ix1]
+        else:
+            k_candidate_3 = self.k_candidate_3
+            ix3 = np.random.randint(len(k_candidate_3))
+            k = k_candidate_3[ix3]
+
+        k = min(k, self.dim)
+
+        return k
+
+    def help_suggest_use_small_k_or_dim_for_fails_num_just_above_threshold(self, k):
+        cap = self.threshold_cap
+        threshold = np.clip(int(self._n_iter / 8), 8, cap)
+        if self.dim <= 25 and self._n_iter <= 300:
+            threshold = max(threshold // 2, 8)
+        begin_level = int(threshold * 0.25)
+        trigger_level = int(threshold * 0.35)
+        if self._fails >= begin_level + threshold:
+            if self._fails < begin_level + threshold + trigger_level or self.in_local_mode():
+                k = 1 if np.mod(self._fails - begin_level - threshold, 6) < 3 else self.dim
+        return k
+
+    def queue_init_X(self, init_points):
+        if self._queue.empty and self.empty:
+            init_points = max(init_points, 5)
+
+        if self.restart_at_iteration == 0:
+            first_init_points = int(0.7*init_points)
+            samples = self.lhs_sample(first_init_points)
+            for point in samples:
+                if point not in self:
+                    self._queue.add(point)
+
+            second_init_points = init_points - first_init_points
+            samples2 = self.lhs_sample_within_domain(second_init_points)
+            for point in samples2:
+                if point not in self:
+                    self._queue.add(point)
+
+        else:
+            samples = self.random_sample_avoid_max_region(num=init_points, anchor=self._global_max_param)
+            for point in samples:
+                if point not in self:
+                    self._queue.add(point)
+
+    def rd_sample_queue_is_empty(self):
+        return self._queue.empty
+
+    def modify_max_if_many_fails(self):
+        cap = 50 if self.large_trial() else 20 if self.medium_trial() else 6
+
+        if self._modify_max_count_3_times > 3*cap:
+            if self.debug:
+                print(Colours.cyan("modify multi-points around max at iteration="), self.iteration)
+            bounds = np.copy(self._bounds)
+            ratio = min(0.01 ** (1 / self.dim), 0.3)
+            bounds = self.do_shrink_bounds(ratio=ratio, bounds=bounds, anchor_sub=self._anchor)
+            ind = np.array(list(map(lambda x: self.is_in_domain(x, bounds), self._params)))
+            dec = max(self._targets) - np.percentile(self._targets, 80)
+            self._targets[ind] -= dec
+            self._modify_max_count_3_times = 0
+
+        elif self._modify_max_count > cap:
+            if self.debug:
+                print(Colours.cyan("modify_max_for_many_fails at iteration="), self.iteration)
+            ind2 = np.argmax(self._targets)
+            v = np.percentile(self._targets, 80)
+            self._targets[ind2] = v
+        else:
+            return
+
+        index = np.argmax(self._targets)
+        self._max_param = self._params[index]
+        self._anchor_last = self._anchor
+        self._anchor = self._max_param
+        self._modify_max_count = 0
+
+    def modify_multi_points_around_max(self, ratio):
+        self.reset_bounds()
+        next_anchor = self.prepare_random_anchor_far()
+
+        self._anchor = self._max_param
+        self._bounds = self.do_shrink_bounds(ratio=ratio)
+
+        ind = np.array(list(map(lambda x: self.is_in_domain(x, self._bounds), self._full_params)))
+        dec = max(self._full_targets) - np.percentile(self._full_targets, 40)
+        self._full_targets[ind] -= dec
+
+        self.reset_bounds_param_target()
+
+        if len(self) > 600:
+            self.discard_data(keep_ratio=0.5, top_ratio=0.2, keep_top=True, modify_top=False)
+
+        self._max_target = np.mean(self._targets)
+        self._anchor_last = self._max_param
+        self._anchor = next_anchor
+        self._max_param = self._anchor
+
+    def _gp_before_fit(self, k_indexes):
+        params = self._gp.kernel.get_params()
+        if self._gp_default:
+            params['k1__constant_value'] = 1.0
+            params['k1__constant_value_bounds'] = "fixed"
+            n = len(k_indexes)
+            if n < 3:
+                params['k2__length_scale'] = self.k2_length_scale[k_indexes]
+                params['k2__length_scale_bounds'] = self.k2_length_scale_bounds[k_indexes]
+            else:
+                params['k2__length_scale'] = stats.gmean(self.k2_length_scale[k_indexes])
+                params['k2__length_scale_bounds'] = self.length_scale_bound
+            r_num = 6 if n < 5 else\
+                    5 if n < 10 else\
+                    4 if n < 15 else\
+                    3 if n < 20 else\
+                    2 if n < 25 else\
+                    1
+            self._gp.n_restarts_optimizer = r_num
+            self._gp.optimizer = self.optimizer_l_bfgs_b #"fmin_l_bfgs_b"
+        else:
+            params['k1__constant_value'] = self.k1_constant_value
+            params['k1__constant_value_bounds'] = self.constant_value_bounds
+            params['k2__length_scale'] = self.k2_length_scale[k_indexes]
+            params['k2__length_scale_bounds'] = self.k2_length_scale_bounds[k_indexes]
+            self._gp.n_restarts_optimizer = 0
+            self._gp.optimizer = self.optimizer_l_bfgs_b
+
+        self._gp.kernel.set_params(**params)
+
+    def _gp_after_fit(self, k_indexes):
+        scales = self._gp.kernel_.get_params()['k2__length_scale']
+        if 0.25 < scales.all()/stats.gmean(self.k2_length_scale[k_indexes]) < 4.0:
+            self.k2_length_scale[k_indexes] = \
+                np.clip(0.9 * self.k2_length_scale[k_indexes] + 0.1 * scales,\
+                    self.length_scale_bound[0], \
+                    self.length_scale_bound[1])
+            self.k1_constant_value = self._gp.kernel_.get_params()['k1__constant_value']
+
+    def shrink_total_space(self, ratio=0.8):
+        print(Colours.blue("shrink_total_space"))
+        if self._adj_num >= 1 or len(self._bounds_stack_extra) >= 1 or self.index_partition >= 0:
+            self.reset_space_to_full_data_and_bounds(merge_partition=True)
+
+        self._max_param = np.copy(self._global_max_param)
+        self._max_target = self._global_max_target
+        self._anchor_last = self._anchor
+        self._anchor = self._max_param
+
+        self._bounds = self.do_shrink_bounds(ratio=ratio)
+        self.rbfx_used_num = self.rbfx_use_cap
+        self.stay = self.stay_max - 1
+        self.filter_data_by_bounds()
+        self._full_params = self._params
+        self._full_targets = self._targets
+        self._original_bounds = np.copy(self._bounds)
+
+    def fast_trust_region(self):
+        if not self.open_fast_trust_region or self._anchor is None or len(self._anchor) == 0:
+            return
+
+        # Apply fast trust region
+        self.update_l_g_cap()
+
+        if self.in_local_mode():
+            # For local_mode
+            self.inc_local_iter()
+            if len(self._bounds_stack_extra) == 0:
+                self.push_halve_bounds(ratio=self.extra_bound_ratio())
+        else:
+            # For global-mode
+            self.inc_global_iter(fail_threshold=self.fail_threshold)
+
+            if len(self._bounds_stack_extra) >= 1:
+                self.pop_halve_bounds()
+        return
+
+    def slow_trust_region(self):
+        if self.with_random_anchor():
+            return
+
+        cap = self.threshold_cap
+        threshold = np.clip(int(self._n_iter / 8), 8, cap)
+        if self.dim <= 25 and self._n_iter <= 300:
+            threshold = max(threshold // 2, 8)
+        begin_level = int(threshold * 0.25)
+        trigger_level = int(threshold * 0.3)
+        max_phase = self.max_phase
+        if self._fails >= begin_level + threshold and self._adj_num < max_phase:
+            if self._fails >= begin_level + threshold + trigger_level and not self.in_local_mode():
+                self.adjust_bounds()
+                self._fails = int(self.threshold_cap * 0.25)
+                if self._adj_num == max_phase:
+                    self.has_reached_max_level = True
+                    self.time_at_max_level = self.iteration
+        elif self._adj_num >= 1 and \
+                (self._success_after_adj >= self.num_success_for_pop() or \
+                 (self._fails < begin_level and np.mod(self._fails, 10) == 9)):
+            self.deque_bounds()
+            if self._adj_num > 0.5 * max_phase:
+                self.deque_bounds()
+            if self._adj_num > 0.75 * max_phase:
+                self.deque_bounds()
+            if self._adj_num == 0:
+                self.adjust_end = True
+        elif self.has_reached_max_level and self.iteration - self.time_at_max_level >= threshold:
+
+            if self.progress() > 0.7:
+                self.reset_space_to_full_data_and_bounds(merge_partition=True)
+            else:
+                self.handle_insufficient_improvement()
+
+            self.threshold_cap_base = min(self.threshold_cap_base + 5, 40)
+            self.threshold_cap_start += 3
+
+    @property
+    def stay_max(self):
+        stay_max = self.stay_max_base
+        if self.progress() > 0.6:
+            stay_max = max(stay_max-1, 1)
+        return stay_max
+
+    @property
+    def upper_bound(self):
+        if len(self._bounds_stack_extra) >= 1:
+            return int(1.2 * self._up_base)
+        else:
+            return self._up_base
+
+    def update_rr_condition(self):
+        self.rr_condition = self.can_do_rr and \
+                            np.mod(self.iteration, self.how_often_do_rr * self.stay_max + 1) \
+                                   <= self.rr_ratio * self.how_often_do_rr * self.stay_max
+        return self.rr_condition
+
+    def has_unused_trial_budget(self):
+        return self.iteration < self._n_iter
+
+    @property
+    def shrink_ratio(self):
+        ratio_set = [0.5, 0.6]
+        check = np.mod((self._adj_num - 1)//self.coord_group, len(ratio_set))
+        return ratio_set[check]
+
+    @property
+    def threshold_cap(self):
+        pi = 3.1415926 * 0.7
+        return int(self.threshold_cap_start + self.threshold_cap_base * np.sin(pi * self._adj_num / self.max_phase))
+
+    @property
+    def num_round(self):
+        return int(self.dim / self.dim_per_round)
+
+    @property
+    def dim_per_round(self):
+        return min(self.rr_set[self.rr_idx], self.dim//2)
+
+    def progress(self):
+        return self.iteration/self._n_iter
+
+    def get_kappa(self):
+        x = self._consecutive_fails/23
+        upper = 3.5 if self.large_trial() else 1.0 if self.small_trial() else 2.5
+        ratio = x - np.floor(x/upper) * upper
+        return self.kappa * (1.0 + ratio)
+
+    def adjust_util_goodness(self, util_id, has_improve):
+        if util_id is None or util_id >= len(self.util_list):
+            return
+        if has_improve:
+            self.goodness[util_id] *= 1.05
+        else:
+            self.goodness[util_id] /= 1.01
+        self.goodness = normalize_probability(self.goodness)
+
+    def opt_margin(self):
+        ratio = 0.15 if len(self._bounds_stack_extra) >= 1 else 0.1
+        return ratio
+
+    def in_local_mode(self):
+        return self._local_mode_now
+
+    def update_l_g_cap(self):
+        progress = self.progress()
+
+        if self.small_trial():
+            g_u, l_u, f_u = 4, 4, 4
+        elif self.medium_trial():
+            g_u, l_u, f_u = 6, 6, 8
+        else: #large_trial
+            g_u, l_u, f_u = 16, 12, 16
+
+        step_global = max(2 * self.stay_max, g_u)
+        step_local = max(2 * self.stay_max, l_u)
+        self.fail_threshold = max(4 * self.stay_max, f_u)
+        inc1 = int(0.7 * step_local * progress)
+        inc2 = min( int(self._n_iter//4000), 2 ) * self.stay_max
+
+        self.iter_local_cap = step_local + inc1 + inc2
+        self.iter_global_cap = step_global + inc2
+
+    def inc_local_iter(self):
+        self.iter_in_local += 1
+        if self.iter_in_local >= self.iter_local_cap and len(self) >= 50:
+            self.reset_l_g_iter()
+            self._local_mode_now = False
+
+    def in_global_mode(self):
+        return not self._local_mode_now
+
+    def reset_l_g_iter(self):
+        self.iter_in_global = 0
+        self.iter_in_local = 0
+
+    def inc_global_iter(self, fail_threshold):
+        if self._consecutive_fails < fail_threshold:
+            self._consecutive_local_modes = 0
+        elif self._consecutive_fails == fail_threshold:
+            self._local_mode_now = True
+            self.reset_l_g_iter()
+            self._consecutive_local_modes += 1
+        else:
+            self.iter_in_global += 1
+            if self.iter_in_global >= self.iter_global_cap:
+                self.reset_l_g_iter()
+                self._local_mode_now = True
+                self._consecutive_local_modes += 1
+
+    def extra_bound_ratio(self):
+        progress = self.progress()
+        factor = 1.0 - 0.5*progress
+
+        ratio_set = [0.7, 0.5]
+        index = np.mod(self._consecutive_local_modes-1, len(ratio_set))
+        ratio = ratio_set[index]
+
+        return ratio * factor
+
+    def half_rr_ratio(self):
+        self.rr_ratio /= 2.0
+
+    def inc_probability(self, k_indexes, can_improve, delta):
+        if k_indexes is None or len(k_indexes) == self.dim:
+            return
+        delta /= self.stay_max
+        if can_improve:
+            alpha = 4.0 if self.dim >= 30 else 2.0
+            self._probability[k_indexes] *= (1.0 + alpha * delta)
+        else:
+            beta = 1.0 if self.dim >= 30 else 2.0
+            self._probability[k_indexes] *= 1/(1.0 + beta * delta)
+        self._probability = normalize_probability(self._probability)
+
+    def select_k_indexes_round_robin(self):
+        ix = self.ix_for_rr
+        if self.in_local_mode():
+            if ix < self.num_round - 2:
+                self._k_indexes = sorted(self.sequence[ix * self.dim_per_round: (ix + 2) * self.dim_per_round])
+            else:
+                self._k_indexes = sorted(self.sequence[(ix - 1) * self.dim_per_round: self.dim])
+        else:
+            if ix < self.num_round - 1:
+                self._k_indexes = sorted(self.sequence[ix * self.dim_per_round: (ix + 1) * self.dim_per_round])
+            else:
+                self._k_indexes = sorted(self.sequence[ix * self.dim_per_round: self.dim])
+
+        self.ix_for_rr = np.mod(self.ix_for_rr + 1, self.num_round)
+        if self.ix_for_rr == 0:
+            try:
+                gradient = self.rbfx.gradient(self.in_unit_cube(self._max_param, range(self.dim)))
+                self.sequence = np.argsort(abs(gradient))
+            except AttributeError:
+                if self.debug:
+                    print("warning: select_k_indexes_round_robin: self.rbfx.gradient is None")
+                pass
+            self.rr_idx = np.mod(self.rr_idx + 1, len(self.rr_set))
+
+        return self._k_indexes
+
+    def select_k_indexes_weight_update(self, k):
+        if self.dim <= 50:
+            if k >= max(0.2 * float(self.dim), 4) and np.random.random() <= 0.7:
+                self._k_indexes = sorted(np.random.choice(self.dim, k, False, self._probability))
+            else:
+                if np.random.random() < 0.9:
+                    # Descending order
+                    self._k_indexes = sorted(np.argsort(-self._probability)[0:k])
+                else:
+                    self._k_indexes = sorted(np.argsort(self._probability)[0:k])
+        else:  # High dim
+            if (k > 20 and np.random.random() <= 0.7) or (k >= 3 and np.random.random() <= 0.25):
+                self._k_indexes = sorted(np.random.choice(self.dim, k, False, self._probability))
+            else:
+                if np.random.random() < 0.9:
+                    # Descending order
+                    self._k_indexes = sorted(np.argsort(-self._probability)[0:k])
+                else:
+                    self._k_indexes = sorted(np.argsort(self._probability)[0:k])
+
+        self.inc_probability(self._k_indexes, False, delta=0.1)
+
+        return self._k_indexes
+
+    def estimate_epsilon(self, data_points, enough_points, margin_ratio):
+        # Default epsilon is "the average distance between nodes" based on a bounding hypercube
+        xi = np.asarray([np.asarray(a, dtype=np.float_).flatten() for a in data_points])
+        if len(xi.shape) == 1:
+            xi = xi[None, :]
+        ximax = np.amax(xi, axis=1)
+        ximin = np.amin(xi, axis=1)
+        edges = ximax - ximin
+        edges = edges[edges > 0.01]
+        ratio = 1.0 if self.iteration <= 0.2 * self._n_iter else\
+                0.95 if self.iteration <= 0.5 * self._n_iter else 0.9
+        epsilon = ratio*np.power(np.prod(edges)/len(data_points), 1.0/edges.size)
+        if not enough_points and self.in_local_mode():
+            epsilon *= (1.0 - margin_ratio)
+        epsilon = max(epsilon, 0.0001)
+        progress = 1.0 - 0.1*self.progress()
+        epsilon *= progress
+        return epsilon
+
+    def select_k_indexes_gp_smoothing(self, k):
+        if self.rbfx is None:
+            return self.select_k_indexes_gp_smoothing_2(k)
+        gradient = self.rbfx.gradient(self.in_unit_cube(self._anchor, range(self.dim)))
+        self._k_indexes = np.argpartition(abs(gradient), -k)[-k:]
+        return self._k_indexes
+
+    def select_k_indexes_gp_smoothing_2(self, k):
+        if not np.array_equal(self._anchor, self._anchor_last) \
+                or self.gradient is None\
+                or abs(self.num_item_gp_smoothing-len(self._params)) >= 2*self.stay_max:
+            vectors = self.in_unit_cube(self._params, range(self.dim)) \
+                      - self.in_unit_cube(self._anchor, range(self.dim))
+            distances = np.linalg.norm(vectors, ord=0.5, axis=1)
+            md = np.percentile(distances, 35)
+            sub_set = np.where(distances < md)
+            distances = distances[sub_set]
+            vectors = vectors[sub_set]
+            sigma = max(np.percentile(distances, 40), 0.01)
+            targets = self._targets[sub_set]
+            weight = np.exp(-(distances/sigma)**2)
+            value_diff = (self._max_target - targets)/(1.0+abs(self._max_target))
+            weight = np.multiply(value_diff, weight)
+            gradient = np.zeros_like(self._params[0])
+            for u_x, f_x in zip(vectors, weight):
+                gradient += (f_x * u_x)
+
+            self.gradient = gradient
+            self.num_item_gp_smoothing = len(self._params)
+
+        else:
+            gradient = self.gradient
+
+        if sum(abs(gradient)) == 0.0:
+            self._k_indexes = self.select_k_indexes_weight_update(k)
+
+        else:
+            self._k_indexes = np.argpartition(abs(gradient), -k)[-k:]
+        return self._k_indexes
 
     def num_success_for_pop(self):
         num = 3 if self._adj_num <= 2 else \
@@ -1384,140 +1554,6 @@ class KernelSpace(object):
             ixx = np.random.randint(len(ind_top))
             return self._full_params[ind_top][ixx]
 
-    def sweep_partitions(self):
-        self.sweep_partitions_k_means()
-        while 1 <= len(self._full_params) <= max(0.01 * self.iteration, 5):
-            self.sweep_partitions_k_means()
-
-        self.clear_bounds_stack()
-        self.reset_bounds_param_target()
-        self.set_up_config()
-
-        if len(self) >= 1:
-            index = np.argmax(self._targets)
-            self._max_param = self._params[index]
-            self._anchor = self._max_param
-            self._max_target = self._targets[index]
-        else:
-            self._max_param = None
-            self._max_target = float("-inf")
-            self._anchor = self._max_param
-            self._anchor_last = self._max_param
-
-        self.restart_at_iteration = self.iteration
-        self.rbf_smooth = 0.02
-        self._consecutive_fails = 0
-        self._modify_max_count = 0
-        self._modify_max_count_3_times = 0
-        self._slowness = 0
-        self.num_restart_space += 1.0
-        self.partition_base_time = 0
-
-    def sweep_partitions_k_means(self):
-        if self.index_partition < 0 or self.data_cluster_array is None:
-            self.help_sweep_partition()
-            self.index_partition = 1
-
-        elif self.index_partition == self.cluster_num - 1:
-            self.data_cluster_array[self.index_partition] = (self._full_params, self._full_targets)
-            self._full_params, self._full_targets = self.data_cluster_array[0]
-            for i in range(1,  self.cluster_num):
-                if len(self.data_cluster_array[i][0]) > 0.02 * self.iteration:
-                    self._full_params = np.concatenate((self._full_params, self.data_cluster_array[i][0]))
-                    self._full_targets = np.concatenate((self._full_targets, self.data_cluster_array[i][1]))
-            self.cluster_num = min(self.cluster_num + 1, self.cluster_num_cap)
-            self.help_sweep_partition()
-            self.index_partition = 0
-
-        else:
-            self.data_cluster_array[self.index_partition] = (self._full_params, self._full_targets)
-            self.index_partition += 1
-
-        self._full_params, self._full_targets = self.data_cluster_array[self.index_partition]
-
-    def help_sweep_partition_by_k_means(self):
-        self.data_cluster_array = [None] * self.cluster_num
-
-        if self.progress() < 0.25 and self.cluster_num < min(self.cluster_num_cap, self.cluster_allow_new):
-            if self.cluster_num >= 3:
-                center_params, _, data_clusters = \
-                   self.k_means(self._full_params, self._full_targets, self.cluster_num-1, concate=True)
-                for i in range(self.cluster_num - 1):
-                   self.data_cluster_array[i] = data_clusters[_hashable(center_params[i])]
-            elif self.cluster_num == 2:
-                self.data_cluster_array[0] = (self._full_params, self._full_targets)
-
-            self.data_cluster_array[self.cluster_num - 1] = (np.empty(shape=(0, self.dim)), np.empty(shape=(0,)))
-
-        else:
-            center_params, _, data_clusters = \
-               self.k_means(self._full_params, self._full_targets, self.cluster_num, concate=True)
-            for i in range(self.cluster_num):
-               self.data_cluster_array[i] = data_clusters[_hashable(center_params[i])]
-
-    def help_sweep_partition(self):
-        self.data_cluster_array = [None] * self.cluster_num
-
-        if self.progress() < 0.25 and self.cluster_num < min(self.cluster_num_cap, self.cluster_allow_new):
-            if self.cluster_num >= 3:
-                data_clusters = self.svm_by_kmeans_y(self._full_params, self._full_targets, self.cluster_num - 1)
-                for i in range(self.cluster_num - 1):
-                    self.data_cluster_array[i] = data_clusters[i]
-            elif self.cluster_num == 2:
-                self.data_cluster_array[0] = (self._full_params, self._full_targets)
-
-            self.data_cluster_array[self.cluster_num - 1] = (np.empty(shape=(0, self.dim)), np.empty(shape=(0,)))
-
-        else:
-            self.data_cluster_array = self.svm_by_kmeans_y(self._full_params, self._full_targets, self.cluster_num)
-
-    def svm_by_kmeans_y(self, X, y, cluster):
-        max_margin = None
-        max_labels = None
-        if len(y) > cluster * 6:
-            expand = 6
-        else:
-            expand = 1
-
-        cluster_expand = cluster * expand
-        for _ in range(5):
-            kmeans = KMeans(n_clusters=cluster_expand).fit(y[:, None])
-            labels = kmeans.labels_
-
-            max_y_cluster = np.empty(shape=(cluster_expand,))
-            for i in np.arange(cluster_expand):
-                tmp_bool = labels == i
-                max_y_cluster[i] = np.max(y[tmp_bool])
-            sorted_indexes = np.argsort(-max_y_cluster)  # largest target first
-            max_y_cluster = max_y_cluster[sorted_indexes]
-            labels = sorted_indexes[labels]
-            margin = 0
-            for i in np.arange(0, cluster_expand - 1):
-                margin += max_y_cluster[i] - max_y_cluster[i + 1]
-            margin /= cluster_expand
-            # merge into smaller clusters
-            labels = np.floor(labels/expand).astype(int)
-            # keep the one with the max_margin
-            if max_margin is None or margin > max_margin:
-                max_margin = margin
-                max_labels = labels
-
-        model = SVC(kernel='poly', gamma='scale', C=100, max_iter=10 ** 6)
-        model.fit(X, max_labels)
-
-        data_cluster_array = [None] * cluster
-        c_labels = model.predict(X)
-        max_cluster = np.empty(shape=(cluster,))
-        for i in np.arange(cluster):
-            index_i = c_labels == i
-            y_sub = y[index_i]
-            max_cluster[i] = np.max(y_sub)
-            data_cluster_array[i] = (X[index_i], y_sub)
-        descend_indexes = np.argsort(-max_cluster)  # largest cluster first
-        data_cluster_array = [data_cluster_array[i] for i in descend_indexes]
-
-        return data_cluster_array
-
     def reduce_domain_for_random_anchor(self, ratio=0.8):
         self.reset_bounds()
         self._bounds = self.do_shrink_bounds(ratio=ratio)
@@ -1750,206 +1786,6 @@ class KernelSpace(object):
         else:
             return False
 
-    def help_suggest_get_k_for_rr_or_normal(self):
-        self.rr_condition = self.update_rr_condition()
-
-        # Round-robin
-        if self.rr_condition:
-            self.is_round_robin = True
-            k = self.dim_per_round
-
-        else:  #none-RR mode
-            k = self.help_suggest_select_non_RR_mode_k_value()
-            self.is_round_robin = False
-            self.noneRR_iter += 1
-            if self._consecutive_fails > 10 and np.mod(self.noneRR_iter, 5) == 0:
-                k = min(self.dim, self.upper_bound)
-
-        return k
-
-    def help_suggest_select_non_RR_mode_k_value(self):
-
-        p = 0.5 + 0.1 * self.progress() + 0.1 * (self._adj_num / self.max_phase)
-
-        if self.in_local_mode() \
-                or np.random.random() < p:
-            k_candidate_1 = self.k_candidate_1
-            ix1 = np.random.randint(len(k_candidate_1))
-            k = k_candidate_1[ix1]
-        else:
-            k_candidate_3 = self.k_candidate_3
-            ix3 = np.random.randint(len(k_candidate_3))
-            k = k_candidate_3[ix3]
-
-        k = min(k, self.dim)
-
-        return k
-
-    def slow_trust_region(self):
-        if self.with_random_anchor():
-            return
-
-        cap = self.threshold_cap
-        threshold = np.clip(int(self._n_iter / 8), 8, cap)
-        if self.dim <= 25 and self._n_iter <= 300:
-            threshold = max(threshold // 2, 8)
-        begin_level = int(threshold * 0.25)
-        trigger_level = int(threshold * 0.3)
-        max_phase = self.max_phase
-        if self._fails >= begin_level + threshold and self._adj_num < max_phase:
-            if self._fails >= begin_level + threshold + trigger_level and not self.in_local_mode():
-                self.adjust_bounds()
-                self._fails = int(self.threshold_cap * 0.25)
-                if self._adj_num == max_phase:
-                    self.has_reached_max_level = True
-                    self.time_at_max_level = self.iteration
-        elif self._adj_num >= 1 and \
-                (self._success_after_adj >= self.num_success_for_pop() or \
-                 (self._fails < begin_level and np.mod(self._fails, 10) == 9)):
-            self.deque_bounds()
-            if self._adj_num > 0.5 * max_phase:
-                self.deque_bounds()
-            if self._adj_num > 0.75 * max_phase:
-                self.deque_bounds()
-            if self._adj_num == 0:
-                self.adjust_end = True
-        elif self.has_reached_max_level and self.iteration - self.time_at_max_level >= threshold:
-
-            if self.progress() > 0.7:
-                self.reset_space_to_full_data_and_bounds(merge_partition=True)
-            else:
-                self.handle_insufficient_improvement()
-
-            self.threshold_cap_base = min(self.threshold_cap_base + 5, 40)
-            self.threshold_cap_start += 3
-
-    def help_suggest_use_small_k_or_dim_for_fails_num_just_above_threshold(self, k):
-        cap = self.threshold_cap
-        threshold = np.clip(int(self._n_iter / 8), 8, cap)
-        if self.dim <= 25 and self._n_iter <= 300:
-            threshold = max(threshold // 2, 8)
-        begin_level = int(threshold * 0.25)
-        trigger_level = int(threshold * 0.35)
-        if self._fails >= begin_level + threshold:
-            if self._fails < begin_level + threshold + trigger_level or self.in_local_mode():
-                k = 1 if np.mod(self._fails - begin_level - threshold, 6) < 3 else self.dim
-        return k
-
-    def queue_init_X(self, init_points):
-        if self._queue.empty and self.empty:
-            init_points = max(init_points, 5)
-
-        if self.restart_at_iteration == 0:
-            first_init_points = int(0.7*init_points)
-            samples = self.lhs_sample(first_init_points)
-            for point in samples:
-                if point not in self:
-                    self._queue.add(point)
-
-            second_init_points = init_points - first_init_points
-            samples2 = self.lhs_sample_within_domain(second_init_points)
-            for point in samples2:
-                if point not in self:
-                    self._queue.add(point)
-
-        else:
-            samples = self.random_sample_avoid_max_region(num=init_points, anchor=self._global_max_param)
-            for point in samples:
-                if point not in self:
-                    self._queue.add(point)
-
-    def rd_sample_queue_is_empty(self):
-        return self._queue.empty
-
-    def modify_max_if_many_fails(self):
-        cap = 50 if self.large_trial() else 20 if self.medium_trial() else 6
-
-        if self._modify_max_count_3_times > 3*cap:
-            if self.debug:
-                print(Colours.cyan("modify multi-points around max at iteration="), self.iteration)
-            bounds = np.copy(self._bounds)
-            ratio = min(0.01 ** (1 / self.dim), 0.3)
-            bounds = self.do_shrink_bounds(ratio=ratio, bounds=bounds, anchor_sub=self._anchor)
-            ind = np.array(list(map(lambda x: self.is_in_domain(x, bounds), self._params)))
-            dec = max(self._targets) - np.percentile(self._targets, 80)
-            self._targets[ind] -= dec
-            self._modify_max_count_3_times = 0
-
-        elif self._modify_max_count > cap:
-            if self.debug:
-                print(Colours.cyan("modify_max_for_many_fails at iteration="), self.iteration)
-            ind2 = np.argmax(self._targets)
-            v = np.percentile(self._targets, 80)
-            self._targets[ind2] = v
-        else:
-            return
-
-        index = np.argmax(self._targets)
-        self._max_param = self._params[index]
-        self._anchor_last = self._anchor
-        self._anchor = self._max_param
-        self._modify_max_count = 0
-
-    def modify_multi_points_around_max(self, ratio):
-        self.reset_bounds()
-        next_anchor = self.prepare_random_anchor_far()
-
-        self._anchor = self._max_param
-        self._bounds = self.do_shrink_bounds(ratio=ratio)
-
-        ind = np.array(list(map(lambda x: self.is_in_domain(x, self._bounds), self._full_params)))
-        dec = max(self._full_targets) - np.percentile(self._full_targets, 40)
-        self._full_targets[ind] -= dec
-
-        self.reset_bounds_param_target()
-
-        if len(self) > 600:
-            self.discard_data(keep_ratio=0.5, top_ratio=0.2, keep_top=True, modify_top=False)
-
-        self._max_target = np.mean(self._targets)
-        self._anchor_last = self._max_param
-        self._anchor = next_anchor
-        self._max_param = self._anchor
-
-    def _gp_before_fit(self, k_indexes):
-        params = self._gp.kernel.get_params()
-        if self._gp_default:
-            params['k1__constant_value'] = 1.0
-            params['k1__constant_value_bounds'] = "fixed"
-            n = len(k_indexes)
-            if n < 3:
-                params['k2__length_scale'] = self.k2_length_scale[k_indexes]
-                params['k2__length_scale_bounds'] = self.k2_length_scale_bounds[k_indexes]
-            else:
-                params['k2__length_scale'] = stats.gmean(self.k2_length_scale[k_indexes])
-                params['k2__length_scale_bounds'] = self.length_scale_bound
-            r_num = 6 if n < 5 else\
-                    5 if n < 10 else\
-                    4 if n < 15 else\
-                    3 if n < 20 else\
-                    2 if n < 25 else\
-                    1
-            self._gp.n_restarts_optimizer = r_num
-            self._gp.optimizer = self.optimizer_l_bfgs_b #"fmin_l_bfgs_b"
-        else:
-            params['k1__constant_value'] = self.k1_constant_value
-            params['k1__constant_value_bounds'] = self.constant_value_bounds
-            params['k2__length_scale'] = self.k2_length_scale[k_indexes]
-            params['k2__length_scale_bounds'] = self.k2_length_scale_bounds[k_indexes]
-            self._gp.n_restarts_optimizer = 0
-            self._gp.optimizer = self.optimizer_l_bfgs_b
-
-        self._gp.kernel.set_params(**params)
-
-    def _gp_after_fit(self, k_indexes):
-        scales = self._gp.kernel_.get_params()['k2__length_scale']
-        if 0.25 < scales.all()/stats.gmean(self.k2_length_scale[k_indexes]) < 4.0:
-            self.k2_length_scale[k_indexes] = \
-                np.clip(0.9 * self.k2_length_scale[k_indexes] + 0.1 * scales,\
-                    self.length_scale_bound[0], \
-                    self.length_scale_bound[1])
-            self.k1_constant_value = self._gp.kernel_.get_params()['k1__constant_value']
-
     def opt_multisample(self, k_indexes):
         self.top_sample = 1
         progress = self.progress()
@@ -1994,137 +1830,6 @@ class KernelSpace(object):
                         self.multisample = 1
                     else:
                         self.multisample = 2
-
-    def suggest_by_cob(self, utility_function):
-
-        if self.debug:
-            self.begin_time = datetime.now()
-
-        params, targets, enough_points = self.params, self.target, True
-
-        targets = copula_gaussian(targets)
-
-        k_indexes = np.arange(self.dim)
-        if self.can_sample:
-            if self.is_initial_sampling():
-                k = min(self.dim, self.upper_bound)
-            else:
-                k = self.help_suggest_get_k_for_rr_or_normal()
-                k = self.help_suggest_use_small_k_or_dim_for_fails_num_just_above_threshold(k)
-
-            if k < self.dim:
-                k_indexes = self.select_k_indexes(k)
-
-                if self.debug:
-                    self.begin_time = datetime.now()
-
-                if self.sub_params is None:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        params, targets = self.esti_virt_points_on_subspace(params, targets, \
-                                                          k_indexes, self._anchor, enough_points)
-                        if self.debug:
-                            print("step 2: esti_virt_points_on_subspace time=",
-                                  (datetime.now() - self.begin_time).total_seconds())
-                            self.begin_time = datetime.now()
-
-                    if self.stay_max >= 1:
-                        self.sub_params, self.sub_targets = params, targets
-                        self.targets_s_copula = np.copy(self.target)
-                else:
-                    params, targets = self.sub_params, self.sub_targets
-
-            else:
-                self._k_indexes = k_indexes
-                self.sub_params = None
-
-            self.stay += 1
-
-        if params is None or len(params) <= 1 or np.isnan(params).any() or np.isinf(params).any():
-            if self._anchor is not None and len(self._anchor) > 0:
-                self.add_random_points(add_num=3, option=1)
-            else:
-                self.add_random_points(add_num=3, option=0)
-            return None, None
-
-        params = self.in_unit_cube(params, k_indexes)
-
-        gp_threshold = 20 if not self.small_trial() else 10
-        if np.mod(self._consecutive_fails, gp_threshold) < gp_threshold/2 and len(k_indexes) <= 30:
-            self._gp_default = True
-        else:
-            self._gp_default = False
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            self._gp_before_fit(k_indexes)
-            try:
-                self._gp.fit(params, targets)
-            except ValueError:
-                self.add_random_points(add_num=1, option=0)
-                return None, None
-            self._gp_after_fit(k_indexes)
-
-        if self.debug:
-            print("step 3: gp_defalt=", self._gp_default, "gp.fit time=", (datetime.now() - self.begin_time).total_seconds())
-            self.begin_time = datetime.now()
-
-        if self.batch <= 1:
-            self.opt_multisample(k_indexes)
-        else:
-            self.multisample = 4
-            self.top_sample = self.batch - 1
-
-        bounds = (self.bounds[k_indexes]-self._original_bounds[k_indexes, 0][:, None])\
-                 /(self._original_bounds[k_indexes, 1][:, None] - self._original_bounds[k_indexes, 0][:, None])
-        anchor = self.in_unit_cube(self._anchor[k_indexes], k_indexes)
-
-        suggestion_subindex_list = acq_max(
-            ac=utility_function.utility,
-            gp=self._gp,
-            multisample=self.multisample,
-            y_max=self._max_target,
-            x_max=anchor,
-            bounds=bounds,
-            random_state=self.random_state,
-            top_sample=self.top_sample
-        )
-
-        suggestion_subindex_list_copy = np.array([self.out_unit_cube(x, k_indexes) for x in suggestion_subindex_list])
-
-        if self.debug:
-            print("step 4: max acquisition, multisample=", self.multisample, "gp_default=", self._gp_default,\
-                  "len(k_index)=", len(k_indexes), "time=", (datetime.now() - self.begin_time).total_seconds())
-            self.begin_time = datetime.now()
-
-        if self.can_sample:
-            suggestion_list = np.empty((len(suggestion_subindex_list_copy), self.dim))
-            for i in range(len(suggestion_list)):
-                suggestion_list[i][k_indexes] = suggestion_subindex_list_copy[i]
-                a = np.arange(self.dim)
-                mask = np.zeros(a.shape, dtype=bool)
-                mask[k_indexes] = True
-                excluded = a[~mask]
-                suggestion_list[i][excluded] = self._anchor[excluded]
-        else:
-            suggestion_list = suggestion_subindex_list_copy
-
-        a = np.arange(len(suggestion_list))
-        mask = np.zeros(a.shape, dtype=bool)
-        for i in a:
-            if suggestion_list[i] not in self:
-                mask[i] = True
-
-        return suggestion_list[mask], k_indexes
-
-    def coordi_bo(self, utility_function):
-        if self._anchor is not None and not self.is_in_domain(self._anchor, self.bounds):
-            self.move_center_by_anchor_param()
-
-        if self.help_suggest_add_points_if_anchorNone_or_less_than_level():
-            return None, None
-
-        return self.suggest_by_cob(utility_function)
 
     def help_suggest_add_points_if_anchorNone_or_less_than_level(self):
 
@@ -2175,139 +1880,8 @@ class KernelSpace(object):
                          cap/(1.5**self.index_partition) + self.partition_base_time\
                    and self._consecutive_fails >= 10
 
-    def do_suggestion(self, utility_function):
-        """New points to evaluate"""
-
-        if len(self._full_params) == 0:
-            self.need_init_sample_iteration = self.iteration
-            self.queue_init_X(self.init_points)
-            return None, None
-
-        if self.allow_partition and \
-                (self.too_many_consecutive_fails_condition() or self.enough_trials_for_one_partition()):
-            self.sweep_partitions()
-            print(Colours.yellow("Repulsive escape at iteration="), self.iteration, \
-                  'in partition index=', self.index_partition, "with", len(self),\
-                  'points from', self.cluster_num, "partitions")
-            return None, None
-
-        # Shrink the original_bounds at the last stage of trials
-        progress = self.progress()
-        if progress > 0.75 and self.iteration >= self.iter_can_shrink_space:
-            self.shrink_total_space()
-            self.iter_can_shrink_space = self.iteration + max(int(0.1 * self._n_iter), 25)
-
-        # Filter out data points if too many are in the current space
-        if (len(self) > self.data_num_cap or len(self._full_targets) > 2.0*self.data_num_cap)\
-                and self._consecutive_fails >= 10 and not self.with_random_anchor():
-            self.discard_data(keep_ratio=0.5, top_ratio=0.2, keep_top=True, modify_top=False)
-
-        self.help_suggest_may_set_random_anchor()
-
-        if not self.with_random_anchor():
-            self.slow_trust_region()
-            self.modify_max_if_many_fails()
-            self.fast_trust_region()
-
-        suggest_list, k_indexes = self.coordi_bo(utility_function)
-
-        if suggest_list is not None and len(suggest_list) > 0:
-            self.last_suggest = suggest_list[0]
-
-        return suggest_list, k_indexes
-
-    def append_new_to_last_subspace(self, new_point, new_value):
-        if self.stay_max >= 1 and self.sub_params is not None:
-            new_point_sub = new_point[self._k_indexes]
-            new_value = norm.ppf((sum(self.targets_s_copula < new_value) +0.5) / (len(self.targets_s_copula) + 1.0))
-            self.sub_params = np.concatenate([self.sub_params, new_point_sub.reshape(1, -1)])
-            self.sub_targets = np.concatenate([self.sub_targets, [new_value]])
-
-    def esti_virt_points_on_subspace(self, data_points, targets, k_indexes, anchor, enough_points):
-        if self.debug:
-            self.begin_time = datetime.now()
-
-        self.update_reuse_rbfx(data_points, targets, enough_points, 0.0)
-
-        if self.debug:
-            print("\niteration=", self.iteration, "step 1: update_reuse_rbfx time=", (datetime.now() - self.begin_time).total_seconds())
-            self.begin_time = datetime.now()
-
-        select_data_points, same_data_index = self.project_to_subspace(data_points, targets, k_indexes, anchor)
-
-        if self.debug:
-            print("project_to_subspace time=", (datetime.now() - self.begin_time).total_seconds())
-            self.begin_time = datetime.now()
-
-        if len(select_data_points) == 0 and len(same_data_index) >= 1:
-            return data_points[same_data_index][:, k_indexes], targets[same_data_index]
-
-        project_data_points = self.in_unit_cube(select_data_points, range(self.dim))
-
-        if self.option == 0:
-            new_target = self.rbfx(*project_data_points.T)
-
-            if self.debug:
-                print("rbfx(*project_data_points.T) len(data)=", len(project_data_points), "time=", (datetime.now() - self.begin_time).total_seconds())
-                self.begin_time = datetime.now()
-
-            targets_max = max(targets)
-            if max(new_target) > targets_max:
-                self.rbf_smooth += 0.02
-                self.rbfx_used_num = self.rbfx_use_cap
-
-                if self.debug:
-                    print("local-new_target rbfx exceeds UPPER BOUND", \
-                           'max(new_target)=', max(new_target), 'copula_max=', targets_max)
-        else: # option == 1:
-            new_target = self.idw_tree(project_data_points, k=4)
-
-        new_data_points = select_data_points[:, k_indexes]
-        if len(same_data_index) > 0:
-            np.concatenate([new_data_points, data_points[same_data_index][:, k_indexes]])
-            np.concatenate([new_target, targets[same_data_index]])
-
-        return new_data_points, new_target
-
-    def project_to_subspace(self, data_points, targets, k_indexes, anchor):
-        a = np.arange(self.dim)
-        mask = np.zeros(a.shape, dtype=bool)
-        mask[k_indexes] = True
-        excluded = a[~mask]
-
-        project_data = []
-        project_value = []
-        same_data_index = []
-        tmp_map = set()
-        for idx, x in enumerate(data_points):
-            y = np.copy(x)
-            if np.all(y[excluded] == anchor[excluded]):
-                same_data_index.append(idx)
-            else:
-                y[excluded] = anchor[excluded]
-                yy = _hashable(y)
-                if yy not in tmp_map:
-                    tmp_map.add(yy)
-                    project_data.append(y)
-                    project_value.append(targets[idx])
-
-        project_data, same_data_index = np.array(project_data), np.array(same_data_index)
-
-        if np.mod(self._consecutive_fails, 20) < 10 and (self.dim < 100 or len(project_data) < 160):
-            return project_data, same_data_index
-
-        else:
-            project_value = np.array(project_value)
-
-            if len(same_data_index) > 200 or len(project_data) <= 1:
-                return [], same_data_index
-            else:
-                ratio = 0.5 if self.dim < 80 else 0.3
-                u_l = 300 if self.dim < 100 else 200
-                top = np.clip(min(len(project_data) - 1, int(ratio * len(data_points))), 1, u_l)
-                ind_top = np.argpartition(project_value, -top)[-top:]
-                project_data = project_data[ind_top]
-                return project_data, same_data_index
+    def long_run_enough_avoid_partitioning(self):
+        return self.iteration - self.restart_at_iteration > 1600
 
     def bool_reuse_rbfx(self):
         condition = ( self.rbfx_used_num < self.rbfx_use_cap or self.last_eval_num == self.eval_num )\
@@ -2348,6 +1922,147 @@ class KernelSpace(object):
                 self.option = 1
                 self.idw_tree = Tree(data, target)
                 self.rbfx = rbfx_last
+
+    def append_new_to_last_subspace(self, new_point, new_value):
+        if self.stay_max >= 1 and self.sub_params is not None:
+            new_point_sub = new_point[self._k_indexes]
+            new_value = norm.ppf((sum(self.targets_s_copula < new_value) +0.5) / (len(self.targets_s_copula) + 1.0))
+            self.sub_params = np.concatenate([self.sub_params, new_point_sub.reshape(1, -1)])
+            self.sub_targets = np.concatenate([self.sub_targets, [new_value]])
+
+    def sweep_partitions(self):
+        self.sweep_partitions_k_means()
+        while 1 <= len(self._full_params) <= max(0.01 * self.iteration, 5):
+            self.sweep_partitions_k_means()
+
+        self.clear_bounds_stack()
+        self.reset_bounds_param_target()
+        self.set_up_config()
+
+        if len(self) >= 1:
+            index = np.argmax(self._targets)
+            self._max_param = self._params[index]
+            self._anchor = self._max_param
+            self._max_target = self._targets[index]
+        else:
+            self._max_param = None
+            self._max_target = float("-inf")
+            self._anchor = self._max_param
+            self._anchor_last = self._max_param
+
+        self.restart_at_iteration = self.iteration
+        self.rbf_smooth = 0.02
+        self._consecutive_fails = 0
+        self._modify_max_count = 0
+        self._modify_max_count_3_times = 0
+        self._slowness = 0
+        self.num_restart_space += 1.0
+        self.partition_base_time = 0
+
+    def sweep_partitions_k_means(self):
+        if self.index_partition < 0 or self.data_cluster_array is None:
+            self.help_sweep_partition()
+            self.index_partition = 1
+
+        elif self.index_partition == self.cluster_num - 1:
+            self.data_cluster_array[self.index_partition] = (self._full_params, self._full_targets)
+            self._full_params, self._full_targets = self.data_cluster_array[0]
+            for i in range(1,  self.cluster_num):
+                if len(self.data_cluster_array[i][0]) > 0.02 * self.iteration:
+                    self._full_params = np.concatenate((self._full_params, self.data_cluster_array[i][0]))
+                    self._full_targets = np.concatenate((self._full_targets, self.data_cluster_array[i][1]))
+            self.cluster_num = min(self.cluster_num + 1, self.cluster_num_cap)
+            self.help_sweep_partition()
+            self.index_partition = 0
+
+        else:
+            self.data_cluster_array[self.index_partition] = (self._full_params, self._full_targets)
+            self.index_partition += 1
+
+        self._full_params, self._full_targets = self.data_cluster_array[self.index_partition]
+
+    def help_sweep_partition_by_k_means(self):
+        self.data_cluster_array = [None] * self.cluster_num
+
+        if self.progress() < 0.25 and self.cluster_num < min(self.cluster_num_cap, self.cluster_allow_new):
+            if self.cluster_num >= 3:
+                center_params, _, data_clusters = \
+                   self.k_means(self._full_params, self._full_targets, self.cluster_num-1, concate=True)
+                for i in range(self.cluster_num - 1):
+                   self.data_cluster_array[i] = data_clusters[_hashable(center_params[i])]
+            elif self.cluster_num == 2:
+                self.data_cluster_array[0] = (self._full_params, self._full_targets)
+
+            self.data_cluster_array[self.cluster_num - 1] = (np.empty(shape=(0, self.dim)), np.empty(shape=(0,)))
+
+        else:
+            center_params, _, data_clusters = \
+               self.k_means(self._full_params, self._full_targets, self.cluster_num, concate=True)
+            for i in range(self.cluster_num):
+               self.data_cluster_array[i] = data_clusters[_hashable(center_params[i])]
+
+    def help_sweep_partition(self):
+        self.data_cluster_array = [None] * self.cluster_num
+
+        if self.progress() < 0.25 and self.cluster_num < min(self.cluster_num_cap, self.cluster_allow_new):
+            if self.cluster_num >= 3:
+                data_clusters = self.svm_by_kmeans_y(self._full_params, self._full_targets, self.cluster_num - 1)
+                for i in range(self.cluster_num - 1):
+                    self.data_cluster_array[i] = data_clusters[i]
+            elif self.cluster_num == 2:
+                self.data_cluster_array[0] = (self._full_params, self._full_targets)
+
+            self.data_cluster_array[self.cluster_num - 1] = (np.empty(shape=(0, self.dim)), np.empty(shape=(0,)))
+
+        else:
+            self.data_cluster_array = self.svm_by_kmeans_y(self._full_params, self._full_targets, self.cluster_num)
+
+    def svm_by_kmeans_y(self, X, y, cluster):
+        max_margin = None
+        max_labels = None
+        if len(y) > cluster * 6:
+            expand = 6
+        else:
+            expand = 1
+
+        cluster_expand = cluster * expand
+        for _ in range(5):
+            kmeans = KMeans(n_clusters=cluster_expand).fit(y[:, None])
+            labels = kmeans.labels_
+
+            max_y_cluster = np.empty(shape=(cluster_expand,))
+            for i in np.arange(cluster_expand):
+                tmp_bool = labels == i
+                max_y_cluster[i] = np.max(y[tmp_bool])
+            sorted_indexes = np.argsort(-max_y_cluster)  # largest target first
+            max_y_cluster = max_y_cluster[sorted_indexes]
+            labels = sorted_indexes[labels]
+            margin = 0
+            for i in np.arange(0, cluster_expand - 1):
+                margin += max_y_cluster[i] - max_y_cluster[i + 1]
+            margin /= cluster_expand
+            # merge into smaller clusters
+            labels = np.floor(labels/expand).astype(int)
+            # keep the one with the max_margin
+            if max_margin is None or margin > max_margin:
+                max_margin = margin
+                max_labels = labels
+
+        model = SVC(kernel='poly', gamma='scale', C=100, max_iter=10 ** 6)
+        model.fit(X, max_labels)
+
+        data_cluster_array = [None] * cluster
+        c_labels = model.predict(X)
+        max_cluster = np.empty(shape=(cluster,))
+        for i in np.arange(cluster):
+            index_i = c_labels == i
+            y_sub = y[index_i]
+            max_cluster[i] = np.max(y_sub)
+            data_cluster_array[i] = (X[index_i], y_sub)
+        descend_indexes = np.argsort(-max_cluster)  # largest cluster first
+        data_cluster_array = [data_cluster_array[i] for i in descend_indexes]
+
+        return data_cluster_array
 
     def norm_p(self, X, Y):
         if X.shape != Y.shape:
@@ -2488,3 +2203,288 @@ class KernelSpace(object):
             print(Colours.yellow(output))
         else:
             print(Colours.red(output))
+
+    def __init__(self, pbounds, n_iter, init_points, batch,
+                 random_state=None, noise=False, open_slow_trust_region=True, open_fast_trust_region=True,
+                 consistent_query=None, restart=False, allow_partition=True):
+
+        self.random_state = ensure_rng(random_state)
+        self.batch = batch
+
+        # The total number of data points
+        self._n_iter = n_iter
+        self.init_points = init_points
+        self.iteration = 0
+
+        self.dim = len(pbounds)
+        self.noise = noise
+        self.open_slow_trust_region = open_slow_trust_region
+        self.open_fast_trust_region = open_fast_trust_region
+        self.consistent_query = consistent_query
+        self.restart = restart
+        self.restart_at_iteration = 0
+        self.can_sample = True if self.dim >= 5 else False
+        self.allow_partition = allow_partition
+
+        self.multisample = 1
+        self.fail_change_multisample = 0
+        self.fail_change_multisample_cap = 50 if n_iter > 1000 else 25
+
+        self.queue_new_X = Queue()
+        self.goodness = None
+        self.util_id = None
+        self.is_rd_sample_list = None
+
+        kappa, xi = 2.5, 0.0
+        self.kappa = kappa
+        self.util_explore = UtilityFunction(kind='ucb', dim=self.dim, kappa=4.0 * kappa, xi=xi)
+        self.threshold_explore = 2 if self.large_trial() else 5
+        util_ei = UtilityFunction(kind='ei', dim=self.dim, kappa=kappa, xi=xi)
+        util_ucb_1 = UtilityFunction(kind='ucb', dim=self.dim, kappa=kappa, xi=xi)
+        util_ucb_2 = UtilityFunction(kind='ucb', dim=self.dim, kappa=0.8 * kappa, xi=xi)
+        util_ucb_3 = UtilityFunction(kind='ucb', dim=self.dim, kappa=1.2 * kappa, xi=xi)
+
+        self.util_list = [util_ei, util_ucb_1, util_ucb_2, util_ucb_3]
+
+        self.util_ind_list = range(len(self.util_list))
+        self.goodness = assign_probability(len(self.util_list))
+
+        self.queue_new_X = Queue()
+
+        self.k_indexes_list = []
+        self.util_id_list = []
+
+        # The default optimizer is "fmin_l_bfgs_b"
+        def optimizer_l_bfgs_b(obj_func, initial_theta, bounds):
+            maxiter = 800 if len(bounds) <= 30 else 30
+            opt_res = minimize(
+                obj_func, initial_theta, method="L-BFGS-B", jac=True,
+                bounds=bounds, options={'maxiter': maxiter, 'disp': False})
+            theta_opt, func_min = opt_res.x, opt_res.fun
+            return theta_opt, func_min
+
+        alpha = 1e-4 if not noise else 1e-3
+        self.optimizer_l_bfgs_b = optimizer_l_bfgs_b
+        self.constant_value_bounds = "fixed"
+        self.length_scale_bound = (0.005, self.dim ** 0.5)
+        self.k1_constant_value = 1.0
+        self.k2_length_scale_bounds = np.repeat([self.length_scale_bound], self.dim, axis=0)
+        self.k2_length_scale = np.ones(self.dim) * 0.5
+        self._gp = GaussianProcessRegressor(
+            kernel=ConstantKernel(constant_value=1.0, constant_value_bounds=self.constant_value_bounds) \
+                   * Matern(nu=2.5, length_scale=0.5, length_scale_bounds=self.length_scale_bound),
+            alpha=alpha,
+            optimizer=self.optimizer_l_bfgs_b,
+            normalize_y=True,
+            n_restarts_optimizer=5,
+            random_state=self.random_state,
+        )
+        self._gp_default = True
+        self._gp_restart_at_iter = 0
+        self.weights = None
+
+        self.has_improve = False
+        self.big_improve = False
+
+        self.increment_sum = 0.0
+        self.increment_num = 0.0
+        self.target_sum = 0.0
+        self.increment_mean = 0.0
+        self.target_mean = 0.0
+        self.increment_exp = 0.0
+        self.target_exp = 0.0
+        self.targets_s_copula = None
+
+        # Get the name of the parameters
+        self._keys = sorted(pbounds)
+
+        # Initially assign uniform distribution for coordinate selection
+        self._probability = assign_probability(self.dim)
+        self._k_indexes = np.arange(self.dim)
+        self._can_change_indexes = False
+
+        # Create an array with parameters bounds
+        self._bounds = np.array(
+            [item[1] for item in sorted(pbounds.items(), key=lambda x: x[0])],
+            dtype=np.float
+        )
+
+        self._original_bounds = np.copy(self._bounds)
+        self._bounds_stack = deque()
+        self._bounds_stack_extra = deque()
+
+        # Pre-allocated memory for X and Y points
+        self._params = np.empty(shape=(0, self.dim))
+        self._targets = np.empty(shape=(0,))
+        self._full_params = np.empty(shape=(0, self.dim))
+        self._full_targets = np.empty(shape=(0,))
+        self.num_partition_space = 0
+        self.partition_base_time = 0
+
+        # The anchor set
+        self.rd_anchor_index = 0
+        self.rd_anchor_set = []
+        self.cycle_for_rd_anchor = 0
+        self.rd_anchor_dis_P25 = 0
+        self.gradient = None
+        self.num_item_gp_smoothing = 0
+        self.gp_reuse = 0
+
+        self._success_after_adj = 0.0
+        self._adj_num = 0
+
+        self.sufficient_improvement = False
+        self.very_close = False
+
+        # Pre-allocate memory for max param and target
+        self._max_param = np.empty(shape=(0, self.dim))
+        self._max_target = float("-inf")
+        self._anchor = self._max_param
+        self._anchor_last = self._max_param
+        self._global_max_param = np.empty(shape=(0, self.dim))
+        self._global_max_target = float("-inf")
+        self._copula_targets_max = float("-inf")
+        self._copula_targets_min = float("-inf")
+
+        # Keep track of unique points observed so far
+        self._cache = {}
+
+        # A queue for suggested data points
+        self._queue = Queue()
+
+        # A counter for the number of consecutive non-improvement trials
+        self._fails = 0
+        self._success = 0
+        self._sub_success = 0
+        self._consecutive_fails = 0
+        self._slowness = 0
+        self._count_success = 0
+        self._modify_max_count = 0
+        self._modify_max_count_3_times = 0
+        self.need_init_sample_iteration = 0
+        self._guard_consecutive_fails = True
+        self._consecutive_local_modes = 0
+        self._local_mode_now = False
+
+        # A counter for the number of tested sub-domain
+        self._tested_other_region_num = 0
+        self._ref_max_num = 0
+        self._time_enter_last_region = 0
+
+        # Round-robin
+        self.sequence = np.arange(self.dim)
+        self.rr_ratio = 0.5
+        self.is_round_robin = False
+        self.ix_for_rr = 0
+        self.stay = 0
+        self.stay_max_base = 5 if self.dim >= 200 else\
+                             4 if self.dim >= 100 else\
+                             3 if self.dim >= 70 else \
+                             2 if self.dim >= 20 else\
+                             1
+        if self.noise:
+            self.stay_max_base += min(self._n_iter//700, 7)
+        else:
+            self.stay_max_base += min(self._n_iter//1000, 3)
+        if self.consistent_query is not None:
+            self.stay_max_base = self.consistent_query
+
+        self.how_often_do_rr = 6 * self.stay_max
+        self.rr_idx = 0
+        self.rr_set = [4, 5, 10, 20]
+        self.rr_condition = False
+
+        # Used for adjust_bounds
+        self.bounds_index = np.random.permutation(self.dim)
+        self.adjust_end = False
+        self.has_reached_max_level = False
+
+        self.coord_group = 1
+
+        self.round = min(int(np.ceil(6/self.coord_group)), 5)
+        self.max_phase = self.round * self.coord_group + 1
+
+        self.not_close = False
+        self.local_bound_ratio = 1.0
+
+        # Threshold of v_clock
+        self.reached_level = 0
+        self.iter_local_cap = 0
+        self.iter_in_local = 0
+        self.iter_global_cap = 0
+        self.iter_in_global = 0
+        self.fail_threshold = 0
+        self.restart_num = 0
+        self.restart_threshold = 1 if self._n_iter < 10000 else 3
+
+        # For modification by median number
+        self.modify_by_median_num = 0
+        self.last_time_modify = 0
+        self.last_time_random_max_scratch = 0
+        self.merge_random_anchor_iteration = 0
+        self.done_reset_random_anchor = False
+        self.iter_can_shrink_space = 0
+
+        # For discarding data
+        self.discard_data_num = 0
+        self.data_num_cap = 900
+
+        self.threshold_cap_base = 15 if self.large_trial() else 12 if self.medium_trial() else 9
+        self.threshold_cap_start = 15 if self.large_trial() else 12 if self.medium_trial() else 9
+
+        self.can_do_rr = (self.dim >= 30) or (self.dim >= 20 and self._n_iter >= 1000)
+
+        self.bench_level_rd_anchor = 0
+        self.set_record_rd_level = False
+
+        self._up_base = 30
+        self.change_max_param_level_base = 0
+        self.change_max_param_level = 0
+        self.rr_condition = False
+
+        self.in_warping_down = False
+        self.time_at_max_level = 0
+
+        self.noneRR_iter = 0
+
+        self.k_candidate_1 = [4, 5, 6, 8] if self.dim <= 10 else \
+                             [7, 8, 9, 11, 12] if self.dim <= 15 else \
+                             [12, 13, 15, 18, 23, 25] if self.dim <= 35 else\
+                             [20, 22, 25, 26, 27, 30]
+
+        self.k_candidate_3 = [2, 3, 4] if self.dim <= 10 else \
+                             [2, 3, 5, 6, 7] if self.dim <= 15 else \
+                             [3, 4, 6, 7, 9, 10] if self.dim <= 35 else\
+                             [4, 6, 7, 9, 11, 12, 15]
+
+        self.sub_params = None
+        self.sub_targets = None
+        self.last_k_indexes = None
+        self.last_eval_num = -1
+        self.eval_num = 0
+
+        self.rbfx = None
+        self.idw_tree = None
+        self.option = 0
+        self.rbfx_used_num = 0
+        self.rbfx_get_top_k_times = 0
+        self.rbfx = None
+        self.reuse_rbfx = False
+        self.rbf_smooth = 0.02
+        self.rbfx_use_cap = 0
+
+        self.num_restart_space = 0.0
+
+        self.last_suggest = None
+
+        self.data_cluster_array = None
+        self.index_partition = -1
+        self.cluster_num = 2
+        self.cluster_num_cap = 3 if self.dim < 20 else\
+                               4 if self.dim < 60 else\
+                               5
+        self.cluster_num_cap = min(self.cluster_num_cap + int(self._n_iter/4000), 8)
+        self.cluster_allow_new = 4
+
+        self.begin_time = datetime.now()
+        self.debug = False
